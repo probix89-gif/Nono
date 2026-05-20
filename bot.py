@@ -106,31 +106,14 @@ active_stop_evs: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ─── ADVANCED TLS FINGERPRINT ROTATION v21.0 ─────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-# ─── TLS FINGERPRINT GENERATOR v22.0 ─────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
 #
-# Replaces the static 23-profile list with a procedural generator that creates
-# an infinite variety of internally-consistent browser fingerprints on demand.
-#
-# Architecture:
-#   TLSFingerprintGenerator.generate(strategy) → profile dict
-#
-#   The profile dict is fully compatible with build_headers_from_profile().
-#   The `impersonate` field maps to curl_cffi's impersonate target (controls
-#   the real TLS handshake: JA3, ALPN, cipher order, extension list).
-#   All HTTP-layer fields (UA, Sec-CH-UA, Accept-*, Priority) are generated
-#   procedurally to match the chosen TLS target precisely.
-#
-# What makes each generated profile unique vs a fixed list:
-#   • Realistic patch versions  (e.g. Chrome 131.0.6778.108, not 131.0.0.0)
-#   • 6 desktop + 4 mobile platform combos per Chrome version  (8 versions)
-#   • macOS version variation for Safari (10_15_7 / 13_x / 14_x / 15_x)
-#   • Multiple Firefox platform strings (Win/Linux/macOS × sub-versions)
-#   • Fresh Accept-Language per call from a 16-locale pool
-#   • Anti-repeat window prevents back-to-back same impersonate target
-#
-# Total unique combinations: ~2000+ (vs 23 in the old static list)
+# Full browser impersonation at TLS/JA3/ALPN + HTTP header layer.
+# 22+ profiles spanning Chrome, Firefox, Edge, Safari across Windows/macOS/
+# Linux/Android/iOS. Each profile carries the exact Accept, Accept-Encoding,
+# Priority, and Sec-CH-UA values the real browser sends so every layer of
+# fingerprinting is consistent.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Diverse Accept-Language pool — real users have different browser locales
@@ -159,347 +142,251 @@ _ACCEPT_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,image/a
 _ACCEPT_SAFARI  = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 
+TLS_PROFILES = [
+    # ── Chrome 110 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome110", "browser": "chrome", "version": 110,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 116 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome116", "browser": "chrome", "version": 116,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 119 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome119", "browser": "chrome", "version": 119,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 120 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 123 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome123", "browser": "chrome", "version": 123,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+    },
+    # ── Chrome 124 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome124", "browser": "chrome", "version": 124,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 126 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome126", "browser": "chrome", "version": 126,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · Windows ────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 131 · Linux ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "priority": "u=0, i",
+    },
+    # ── Chrome 120 · macOS ──────────────────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Chrome 131 · Android (Pixel 8) ──────────────────────────────────────
+    {
+        "impersonate": "chrome131", "browser": "chrome", "version": 131,
+        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "mobile": True, "priority": "u=0, i",
+    },
+    # ── Chrome 120 · Android (Samsung) ──────────────────────────────────────
+    {
+        "impersonate": "chrome120", "browser": "chrome", "version": 120,
+        "ua": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
+        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "platform": '"Android"', "accept": _ACCEPT_CHROME,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Edge 99 · Windows ───────────────────────────────────────────────────
+    {
+        "impersonate": "edge99", "browser": "edge", "version": 99,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36 Edg/99.0.1150.55",
+        "sec_ch_ua": '"Microsoft Edge";v="99", "Chromium";v="99", "Not;A=Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Edge 101 · Windows ──────────────────────────────────────────────────
+    {
+        "impersonate": "edge101", "browser": "edge", "version": 101,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39",
+        "sec_ch_ua": '"Microsoft Edge";v="101", "Chromium";v="101", "Not;A=Brand";v="24"',
+        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "priority": "u=0, i",
+    },
+    # ── Safari 15.5 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari15_5", "browser": "safari", "version": 155,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.0 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_0", "browser": "safari", "version": 170,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 18.0 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "safari18_0", "browser": "safari", "version": 180,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "sec_ch_ua": None,
+        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+    },
+    # ── Safari 17.2 · iOS ───────────────────────────────────────────────────
+    {
+        "impersonate": "safari17_2_ios", "browser": "safari", "version": 172,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Safari 18.0 · iOS ───────────────────────────────────────────────────
+    {
+        "impersonate": "safari18_0", "browser": "safari", "version": 180,
+        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "sec_ch_ua": None,
+        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
+        "mobile": True,
+    },
+    # ── Firefox 133 · Windows ───────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 133 · Linux ─────────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+    # ── Firefox 133 · macOS ─────────────────────────────────────────────────
+    {
+        "impersonate": "firefox133", "browser": "firefox", "version": 133,
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "sec_ch_ua": None,
+        "platform": None, "accept": _ACCEPT_FIREFOX,
+        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
+        "firefox": True,
+    },
+]
 
-class TLSFingerprintGenerator:
-    """
-    Procedural TLS + HTTP header fingerprint generator.
-
-    Call generate(strategy) to get one fresh profile dict.
-    Compatible with build_headers_from_profile() — no downstream changes needed.
-
-    Strategies:
-      "weighted"  — 2025 market-share distribution (default, best for realism)
-      "random"    — uniform random across all browser families
-      "round"     — cycles deterministically through all impersonate targets
-    """
-
-    # ── curl_cffi impersonate targets per Chrome major version ───────────────
-    # imp       = curl_cffi target (controls JA3/ALPN/cipher order)
-    # enc       = Accept-Encoding matching that Chrome version
-    # priority  = whether this version sends Priority header
-    _CHROME_META: dict = {
-        110: {"imp": "chrome110",  "enc": "gzip, deflate, br",         "priority": False},
-        116: {"imp": "chrome116",  "enc": "gzip, deflate, br",         "priority": False},
-        119: {"imp": "chrome119",  "enc": "gzip, deflate, br",         "priority": False},
-        120: {"imp": "chrome120",  "enc": "gzip, deflate, br",         "priority": False},
-        123: {"imp": "chrome123",  "enc": "gzip, deflate, br, zstd",   "priority": True},
-        124: {"imp": "chrome124",  "enc": "gzip, deflate, br, zstd",   "priority": True},
-        126: {"imp": "chrome126",  "enc": "gzip, deflate, br, zstd",   "priority": True},
-        131: {"imp": "chrome131",  "enc": "gzip, deflate, br, zstd",   "priority": True},
-    }
-
-    # Real Sec-CH-UA brand strings Chrome sends per major version.
-    # The "GREASE" brand token changes spelling each version — these are exact.
-    _CHROME_BRANDS: dict = {
-        110: '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-        116: '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
-        119: '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-        120: '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        123: '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-        124: '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        126: '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
-        131: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    }
-
-    # Realistic patch build strings per Chrome major version.
-    # These are actual builds that shipped — not fake "x.0.0.0" placeholders.
-    _CHROME_PATCHES: dict = {
-        110: ["110.0.5481.77",  "110.0.5481.100", "110.0.5481.178", "110.0.5481.192"],
-        116: ["116.0.5845.96",  "116.0.5845.110", "116.0.5845.140", "116.0.5845.180"],
-        119: ["119.0.6045.105", "119.0.6045.123", "119.0.6045.160", "119.0.6045.199"],
-        120: ["120.0.6099.56",  "120.0.6099.109", "120.0.6099.130", "120.0.6099.144"],
-        123: ["123.0.6312.58",  "123.0.6312.86",  "123.0.6312.105", "123.0.6312.122"],
-        124: ["124.0.6367.60",  "124.0.6367.82",  "124.0.6367.118", "124.0.6367.155"],
-        126: ["126.0.6478.56",  "126.0.6478.114", "126.0.6478.127", "126.0.6478.182"],
-        131: ["131.0.6778.69",  "131.0.6778.85",  "131.0.6778.108", "131.0.6778.140"],
-    }
-
-    # Desktop OS/platform combos for Chrome (ua_fragment, sec-ch-ua-platform)
-    _CHROME_DESKTOP_PLATFORMS: list = [
-        ("Windows NT 10.0; Win64; x64",        '"Windows"'),
-        ("Windows NT 10.0; Win64; x64",        '"Windows"'),   # weighted higher
-        ("Macintosh; Intel Mac OS X 10_15_7",  '"macOS"'),
-        ("Macintosh; Intel Mac OS X 13_6_1",   '"macOS"'),
-        ("Macintosh; Intel Mac OS X 14_2_1",   '"macOS"'),
-        ("Macintosh; Intel Mac OS X 15_0",     '"macOS"'),
-        ("X11; Linux x86_64",                  '"Linux"'),
-        ("X11; Ubuntu; Linux x86_64",          '"Linux"'),
-    ]
-
-    # Mobile device specs for Chrome Android
-    _CHROME_MOBILE_DEVICES: list = [
-        ("Linux; Android 14; Pixel 8",          "Pixel 8"),
-        ("Linux; Android 14; Pixel 8 Pro",      "Pixel 8 Pro"),
-        ("Linux; Android 14; Pixel 7",          "Pixel 7"),
-        ("Linux; Android 13; SM-S918B",         "SM-S918B"),
-        ("Linux; Android 13; SM-S908B",         "SM-S908B"),
-        ("Linux; Android 13; SM-A546B",         "SM-A546B"),
-        ("Linux; Android 12; M2101K7AG",        "M2101K7AG"),
-    ]
-
-    # Edge versions: imp, chrome_base, edge_build, chrome_patch
-    _EDGE_META: dict = {
-        99:  {"imp": "edge99",  "chrome_patch": "99.0.4844.84",   "edge_build": "99.0.1150.55",  "enc": "gzip, deflate, br",      "priority": False},
-        101: {"imp": "edge101", "chrome_patch": "101.0.4951.54",  "edge_build": "101.0.1210.39", "enc": "gzip, deflate, br",      "priority": True},
-    }
-    _EDGE_BRANDS: dict = {
-        99:  '"Microsoft Edge";v="99", "Chromium";v="99", "Not;A=Brand";v="24"',
-        101: '"Microsoft Edge";v="101", "Chromium";v="101", "Not;A=Brand";v="24"',
-    }
-
-    # Safari desktop versions: imp, version_str, webkit, macos variants
-    _SAFARI_DESKTOP: list = [
-        {"imp": "safari15_5", "ver": "15.5", "webkit": "605.1.15",
-         "macos_variants": ["10_15_7", "11_6_8", "12_6_3"]},
-        {"imp": "safari17_0", "ver": "17.0", "webkit": "605.1.15",
-         "macos_variants": ["13_6",   "13_6_1", "14_0"]},
-        {"imp": "safari17_0", "ver": "17.2", "webkit": "605.1.15",
-         "macos_variants": ["13_6_3", "14_2",   "14_2_1"]},
-        {"imp": "safari18_0", "ver": "18.0", "webkit": "605.1.15",
-         "macos_variants": ["14_7",   "15_0",   "15_1"]},
-        {"imp": "safari18_0", "ver": "18.1", "webkit": "605.1.15",
-         "macos_variants": ["15_1",   "15_2",   "15_3"]},
-    ]
-
-    # Safari iOS versions
-    _SAFARI_IOS: list = [
-        {"imp": "safari17_2_ios", "ver": "17.2", "webkit": "605.1.15", "ios": "17_2"},
-        {"imp": "safari17_2_ios", "ver": "17.4", "webkit": "605.1.15", "ios": "17_4"},
-        {"imp": "safari18_0",     "ver": "18.0", "webkit": "605.1.15", "ios": "18_0"},
-        {"imp": "safari18_0",     "ver": "18.1", "webkit": "605.1.15", "ios": "18_1"},
-    ]
-
-    # Firefox: version → platforms list
-    _FIREFOX_META: dict = {
-        128: {"imp": "firefox133", "enc": "gzip, deflate, br, zstd",   # use ff133 TLS
-              "platforms": ["Windows NT 10.0; Win64; x64",
-                            "X11; Linux x86_64",
-                            "X11; Ubuntu; Linux x86_64",
-                            "Macintosh; Intel Mac OS X 13.6",
-                            "Macintosh; Intel Mac OS X 14.2"]},
-        133: {"imp": "firefox133", "enc": "gzip, deflate, br, zstd",
-              "platforms": ["Windows NT 10.0; Win64; x64",
-                            "Windows NT 10.0; Win64; x64",  # weighted
-                            "X11; Linux x86_64",
-                            "X11; Ubuntu; Linux x86_64",
-                            "Macintosh; Intel Mac OS X 14.5",
-                            "Macintosh; Intel Mac OS X 15.0"]},
-    }
-
-    # Round-robin cycle state (for "round" strategy)
-    _ALL_IMPERSONATES: list = [
-        "chrome110", "chrome116", "chrome119", "chrome120",
-        "chrome123", "chrome124", "chrome126", "chrome131",
-        "edge99", "edge101",
-        "safari15_5", "safari17_0", "safari18_0", "safari17_2_ios",
-        "firefox133",
-    ]
-    _round_idx: int = 0
-
-    def generate(self, strategy: str = "weighted") -> dict:
-        """Return one freshly generated TLS + HTTP profile dict."""
-        if strategy == "round":
-            # Deterministic cycle — pick target then generate matching profile
-            imp = self._ALL_IMPERSONATES[
-                self._round_idx % len(self._ALL_IMPERSONATES)]
-            TLSFingerprintGenerator._round_idx += 1
-            return self._gen_for_impersonate(imp)
-
-        if strategy == "weighted":
-            r = random.random()
-            if   r < 0.60: return self._gen_chrome(mobile=False)
-            elif r < 0.70: return self._gen_firefox()
-            elif r < 0.78: return self._gen_edge()
-            elif r < 0.88: return self._gen_safari_desktop()
-            else:          return self._gen_mobile()
-        else:
-            # uniform random
-            fn = random.choice([
-                self._gen_chrome,
-                lambda: self._gen_chrome(mobile=True),
-                self._gen_firefox,
-                self._gen_edge,
-                self._gen_safari_desktop,
-                self._gen_safari_ios,
-            ])
-            return fn()
-
-    def _gen_chrome(self, version: int | None = None,
-                    mobile: bool = False) -> dict:
-        if version is None:
-            # Weight newer versions higher (more common in the wild)
-            weights = [1, 1, 1, 2, 2, 2, 3, 5]   # 110→131
-            version = random.choices(list(self._CHROME_META.keys()), weights)[0]
-        meta      = self._CHROME_META[version]
-        full_ver  = random.choice(self._CHROME_PATCHES.get(version, [f"{version}.0.0.0"]))
-        brand     = self._CHROME_BRANDS[version]
-
-        if mobile:
-            device, _ = random.choice(self._CHROME_MOBILE_DEVICES)
-            ua = (f"Mozilla/5.0 ({device}) AppleWebKit/537.36 "
-                  f"(KHTML, like Gecko) Chrome/{full_ver} Mobile Safari/537.36")
-            platform = '"Android"'
-        else:
-            ua_os, platform = random.choice(self._CHROME_DESKTOP_PLATFORMS)
-            ua = (f"Mozilla/5.0 ({ua_os}) AppleWebKit/537.36 "
-                  f"(KHTML, like Gecko) Chrome/{full_ver} Safari/537.36")
-
-        profile: dict = {
-            "impersonate": meta["imp"],
-            "browser":     "chrome",
-            "version":     version,
-            "ua":          ua,
-            "sec_ch_ua":   brand,
-            "platform":    platform,
-            "accept":      _ACCEPT_CHROME,
-            "accept_lang": random.choice(_LANG_POOL),
-            "accept_enc":  meta["enc"],
-            "mobile":      mobile,
-        }
-        if meta["priority"]:
-            profile["priority"] = "u=0, i"
-        return profile
-
-    def _gen_mobile(self) -> dict:
-        return (self._gen_chrome(mobile=True)
-                if random.random() < 0.70
-                else self._gen_safari_ios())
-
-    def _gen_edge(self, version: int | None = None) -> dict:
-        if version is None:
-            version = random.choice(list(self._EDGE_META.keys()))
-        meta = self._EDGE_META[version]
-        ua   = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{meta['chrome_patch']} "
-                f"Safari/537.36 Edg/{meta['edge_build']}")
-        profile: dict = {
-            "impersonate": meta["imp"],
-            "browser":     "edge",
-            "version":     version,
-            "ua":          ua,
-            "sec_ch_ua":   self._EDGE_BRANDS[version],
-            "platform":    '"Windows"',
-            "accept":      _ACCEPT_EDGE,
-            "accept_lang": random.choice(_LANG_POOL),
-            "accept_enc":  meta["enc"],
-            "mobile":      False,
-        }
-        if meta["priority"]:
-            profile["priority"] = "u=0, i"
-        return profile
-
-    def _gen_safari_desktop(self) -> dict:
-        meta  = random.choice(self._SAFARI_DESKTOP)
-        macos = random.choice(meta["macos_variants"])
-        ua    = (f"Mozilla/5.0 (Macintosh; Intel Mac OS X {macos}) "
-                 f"AppleWebKit/{meta['webkit']} (KHTML, like Gecko) "
-                 f"Version/{meta['ver']} Safari/{meta['webkit']}")
-        ver_int = int(meta["ver"].replace(".", ""))
-        return {
-            "impersonate": meta["imp"],
-            "browser":     "safari",
-            "version":     ver_int,
-            "ua":          ua,
-            "sec_ch_ua":   None,
-            "platform":    '"macOS"',
-            "accept":      _ACCEPT_SAFARI,
-            "accept_lang": random.choice(_LANG_POOL),
-            "accept_enc":  "gzip, deflate, br",
-            "mobile":      False,
-        }
-
-    def _gen_safari_ios(self) -> dict:
-        meta = random.choice(self._SAFARI_IOS)
-        ua   = (f"Mozilla/5.0 (iPhone; CPU iPhone OS {meta['ios']} like Mac OS X) "
-                f"AppleWebKit/{meta['webkit']} (KHTML, like Gecko) "
-                f"Version/{meta['ver']} Mobile/15E148 Safari/604.1")
-        ver_int = int(meta["ver"].replace(".", ""))
-        return {
-            "impersonate": meta["imp"],
-            "browser":     "safari",
-            "version":     ver_int,
-            "ua":          ua,
-            "sec_ch_ua":   None,
-            "platform":    '"iOS"',
-            "accept":      _ACCEPT_SAFARI,
-            "accept_lang": random.choice(_LANG_POOL),
-            "accept_enc":  "gzip, deflate, br",
-            "mobile":      True,
-        }
-
-    def _gen_firefox(self, version: int | None = None) -> dict:
-        if version is None:
-            version = random.choice(list(self._FIREFOX_META.keys()))
-        meta = self._FIREFOX_META[version]
-        plat = random.choice(meta["platforms"])
-        ua   = (f"Mozilla/5.0 ({plat}; rv:{version}.0) "
-                f"Gecko/20100101 Firefox/{version}.0")
-        return {
-            "impersonate": meta["imp"],
-            "browser":     "firefox",
-            "version":     version,
-            "ua":          ua,
-            "sec_ch_ua":   None,
-            "platform":    None,
-            "accept":      _ACCEPT_FIREFOX,
-            "accept_lang": random.choice(_LANG_POOL),
-            "accept_enc":  meta["enc"],
-            "mobile":      False,
-            "firefox":     True,
-        }
-
-    def _gen_for_impersonate(self, imp: str) -> dict:
-        """Generate a profile for a specific impersonate target (round strategy)."""
-        if imp.startswith("chrome"):
-            ver_str = imp.replace("chrome", "")
-            ver = int(ver_str) if ver_str.isdigit() else 131
-            return self._gen_chrome(version=ver)
-        if imp.startswith("edge"):
-            ver_str = imp.replace("edge", "")
-            ver = int(ver_str) if ver_str.isdigit() else 101
-            return self._gen_edge(version=ver)
-        if imp.startswith("firefox"):
-            ver_str = imp.replace("firefox", "")
-            ver = int(ver_str) if ver_str.isdigit() else 133
-            return self._gen_firefox(version=ver)
-        if "ios" in imp:
-            return self._gen_safari_ios()
-        if imp.startswith("safari"):
-            return self._gen_safari_desktop()
-        return self._gen_chrome()
-
-
-# ── Singleton generator instance ──────────────────────────────────────────────
-_tls_generator = TLSFingerprintGenerator()
-
-# Anti-repeat window: tracks last N impersonate targets used globally
-_tls_last:       list = []
-_TLS_ANTI_REPEAT: int = 4   # don't reuse same impersonate within last 4 calls
-
-# Backward-compat shim so len(TLS_PROFILES) still works in status messages
-TLS_PROFILES = _tls_generator._ALL_IMPERSONATES   # list of 15 unique targets
+# Cycling iterator (thread-safe ish — used as a hint only)
+_tls_cycle = itertools.cycle(TLS_PROFILES)
+_tls_lock  = asyncio.Lock()
+_tls_last  = []         # tracks last N profiles used to avoid consecutive repeats
+_TLS_ANTI_REPEAT = 3   # don't repeat same impersonate within this window
 
 
 def get_tls_profile(strategy: str = "random") -> dict:
     """
-    Generate (not pick from a list) a fresh TLS fingerprint profile.
-
-    Strategies:
-      "weighted" — 2025 market-share distribution (recommended)
-      "random"   — uniform random across all browser families
-      "round"    — deterministic cycle through all impersonate targets
+    Get a TLS profile.
+      - "random"   : uniform random with anti-repeat window (best for diversity)
+      - "round"    : strict round-robin (predictable distribution)
+      - "weighted" : market-share weighted (Chrome dominant, Firefox included)
     """
     global _tls_last
+    if strategy == "round":
+        return next(_tls_cycle)
 
-    for _attempt in range(6):   # up to 6 tries to avoid repeating impersonate
-        profile = _tls_generator.generate(strategy=strategy)
-        if profile["impersonate"] not in _tls_last[-_TLS_ANTI_REPEAT:]:
-            break
+    if strategy == "weighted":
+        # Realistic 2025 browser market share weights
+        r = random.random()
+        if r < 0.62:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "chrome" and not p.get("mobile")]
+        elif r < 0.72:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "firefox"]
+        elif r < 0.80:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "edge"]
+        elif r < 0.90:
+            pool = [p for p in TLS_PROFILES if p["browser"] == "safari" and not p.get("mobile")]
+        else:
+            pool = [p for p in TLS_PROFILES if p.get("mobile")]
+        candidates = pool or TLS_PROFILES
+    else:
+        candidates = TLS_PROFILES
 
-    _tls_last.append(profile["impersonate"])
-    if len(_tls_last) > _TLS_ANTI_REPEAT * 3:
+    # Anti-repeat: exclude profiles whose impersonate was recently used
+    recent = set(_tls_last[-_TLS_ANTI_REPEAT:])
+    filtered = [p for p in candidates if p["impersonate"] not in recent]
+    chosen = random.choice(filtered if filtered else candidates)
+
+    # Update anti-repeat window
+    _tls_last.append(chosen["impersonate"])
+    if len(_tls_last) > _TLS_ANTI_REPEAT * 2:
         _tls_last = _tls_last[-_TLS_ANTI_REPEAT:]
-    return profile
+    return chosen
 
 
 def build_headers_from_profile(profile: dict, referer: str | None = None,
@@ -2483,7 +2370,7 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         f"📄 Pages/dork : {XTREAM_PAGES_PER_DORK}\n"
         f"⚙️ Workers    : {total_workers} ({n_chunks}×{workers_n})\n"
         f"🔄 Session pool: {XTREAM_SESSION_POOL_SIZE}\n"
-        f"🛡 TLS       : ∞ generated (Chrome/Firefox/Edge/Safari)\n"
+        f"🛡 TLS profiles: {len(TLS_PROFILES)} rotating\n"
         f"🌐 Network    : {proxy_info}\n{'━'*30}\n⏳ Warming sessions...",
     )
 
@@ -2841,10 +2728,10 @@ async def run_dork_job(chat_id, dorks, context):
     else: proxy_info = "🔓 Direct"
 
     yahoo_adv = "yahoo" in engines
-    tls_line  = (f"🔒 TLS      : ∞ generated | Chrome/Firefox/Edge/Safari\n"
+    tls_line  = (f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n"
                  f"⚡ Yahoo    : ADV-TLS | 15 mirrors | cookie-seeded\n"
                  if yahoo_adv else
-                 f"🔒 TLS      : ∞ generated | Chrome/Firefox/Edge/Safari\n")
+                 f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n")
     status_msg = await context.bot.send_message(
         chat_id,
         f"🕷 DORK PARSER v21.0 — STARTED\n{'━'*30}\n"
@@ -3059,7 +2946,7 @@ async def cmd_start(update, context):
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🆕 NEW in v20.0:\n"
         "  ⚡ /xtream — 1000 URLs/sec Yahoo bruteforce\n"
-        f"  🔒 ∞ TLS fingerprints generated per-request\n"
+        f"  🔒 {len(TLS_PROFILES)} TLS fingerprints rotating\n"
         "  🚀 200 URLs/sec standard mode\n"
         "  🔘 Fully working inline keyboards\n\n"
         f"{proxy_status}\n\n"
@@ -3146,7 +3033,7 @@ async def cmd_xtream(update, context):
             f"⚙️ Workers    : {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} total\n"
             f"📄 Pages/dork : {XTREAM_PAGES_PER_DORK}\n"
             f"🔄 Sessions   : {XTREAM_SESSION_POOL_SIZE} pre-warmed pool\n"
-            f"🛡 TLS       : ∞ generated per-request (fingerprint gen)\n"
+            f"🛡 TLS profiles: {len(TLS_PROFILES)} rotating per-request\n"
             f"💀 Anti-block : per-worker adaptive cooldown (no race)\n"
             f"🍪 Cookie seed: {'enabled' if XTREAM_PRESEED_COOKIES else 'disabled'}\n"
             f"{'━'*30}\n"
@@ -3321,7 +3208,7 @@ async def cmd_settings(update, context):
         f"🛡 SQL ≥    : {s.get('min_score', 30)}\n"
         f"🧅 Tor      : {'ON' if s.get('tor') else 'OFF'}\n"
         f"⚡ Xtream   : {'ON 🚀' if s.get('xtream') else 'OFF'}\n"
-        f"{proxy_line}🔒 TLS      : ∞ generated (fingerprint generator)\n"
+        f"{proxy_line}🔒 TLS pool : {len(TLS_PROFILES)} profiles\n"
         f"━━━━━━━━━━━━━━━━━━━━━━",
         reply_markup=main_menu_keyboard(s),
     )
@@ -3771,7 +3658,7 @@ async def handle_callback(update, context):
                 f"🧅 Tor      : {'ON' if sess.get('tor') else 'OFF'}\n"
                 f"⚡ Xtream   : {'ON 🚀' if sess.get('xtream') else 'OFF'}\n"
                 f"🔄 Proxies  : {alive}/{len(_proxy_pool)} alive\n"
-                f"🔒 TLS      : ∞ generated (fingerprint generator)\n"
+                f"🔒 TLS pool : {len(TLS_PROFILES)} profiles\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Change with: /workers /chunks /engine /maxres /filter /tor /xtream",
                 reply_markup=main_menu_keyboard(sess),
@@ -3805,7 +3692,7 @@ async def handle_callback(update, context):
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 Yahoo bruteforce @ 1000 RPS\n"
                 f"⚙️ {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} workers, {XTREAM_SESSION_POOL_SIZE} sessions\n"
-                f"🛡 TLS : ∞ generated per-request (fingerprint gen)\n"
+                f"🛡 {len(TLS_PROFILES)} TLS profiles rotating\n"
                 f"💡 Now /dork or upload .txt to run xtream"
             )
         else:
@@ -3990,7 +3877,7 @@ def main():
 
     log.info("=" * 60)
     log.info("  DORK PARSER v21.0 — XTREAM EDITION")
-    log.info(  "  TLS profiles : ∞ generated — TLSFingerprintGenerator v22.0 (Chrome/Firefox/Edge/Safari)")
+    log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
     log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
     log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
