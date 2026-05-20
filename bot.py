@@ -2956,7 +2956,7 @@ async def cmd_start(update, context):
         "  /dorkcheck <q>— validate dork\n"
         "  /mutate <q>   — generate variations\n"
         "  /clean        — URL cleaner\n"
-        "  /pages        — page selector\n"
+        "  /pages [N|1-10|1,3,5] — set pages\n"
         "  /workers N    — workers/chunk (1-60)\n"
         "  /chunks N     — parallel chunks (1-8)\n"
         "  /engine X     — bing|yahoo|ddg|all\n"
@@ -3091,11 +3091,68 @@ async def cmd_mutate(update, context):
 
 
 async def cmd_pages(update, context):
+    """
+    /pages              — open interactive keyboard
+    /pages 5            — set pages 1-5
+    /pages 1-10         — set page range (inclusive)
+    /pages 1,3,5,7      — set specific pages
+    """
     chat_id = update.effective_chat.id
-    selected = get_session(chat_id).get("pages", [1])
+    sess    = get_session(chat_id)
+
+    if not context.args:
+        # No args → open the interactive keyboard as before
+        selected = sess.get("pages", [1])
+        await update.message.reply_text(
+            f"📄 SELECT PAGES (1–70)\n"
+            f"Currently: {', '.join(str(p) for p in sorted(selected))}\n\n"
+            f"💡 Tip: /pages <N> sets 1–N  |  /pages 1-10  |  /pages 1,3,5",
+            reply_markup=page_keyboard(selected),
+        )
+        return
+
+    raw = " ".join(context.args).strip()
+    pages = []
+
+    try:
+        if "-" in raw and "," not in raw:
+            # Range: "3-10"
+            parts = raw.split("-", 1)
+            start = max(1, min(int(parts[0].strip()), 70))
+            end   = max(1, min(int(parts[1].strip()), 70))
+            if start > end:
+                start, end = end, start
+            pages = list(range(start, end + 1))
+        elif "," in raw:
+            # Comma list: "1,3,5,7"
+            pages = sorted(set(
+                max(1, min(int(x.strip()), 70))
+                for x in raw.split(",") if x.strip().isdigit()
+            ))
+        else:
+            # Single number N → pages 1..N
+            n = max(1, min(int(raw), 70))
+            pages = list(range(1, n + 1))
+    except Exception:
+        await update.message.reply_text(
+            "⚠️ Invalid format.\n"
+            "Usage:\n"
+            "  /pages 5        → pages 1–5\n"
+            "  /pages 3-10     → pages 3 to 10\n"
+            "  /pages 1,3,5    → specific pages\n"
+            "  /pages          → open selector keyboard"
+        )
+        return
+
+    if not pages:
+        pages = [1]
+
+    sess["pages"] = pages
+    label = (f"1–{pages[-1]}" if pages == list(range(1, pages[-1] + 1))
+             else ", ".join(str(p) for p in pages))
     await update.message.reply_text(
-        f"📄 SELECT PAGES (1–70)\nSelected: {', '.join(str(p) for p in selected)}",
-        reply_markup=page_keyboard(selected),
+        f"✅ Pages set: {label}\n"
+        f"📄 Total: {len(pages)} page(s)"
     )
 
 
