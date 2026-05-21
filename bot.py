@@ -3346,5 +3346,229 @@ async def handle_callback(update, context):
         except Exception: pass
         return
 
-    if__name__ == "__main__":
+
+    if data == "m_yahoo_ub":
+        sess["yahoo_ub"] = not sess.get("yahoo_ub", True)
+        if sess["yahoo_ub"]:
+            msg = (f"🛡 YAHOO UNBLOCKABLE ENABLED\n{'━'*28}\n"
+                   f"🔒 {len(TLS_PROFILES)} TLS profiles rotating\n"
+                   f"🌐 {len(YAHOO_MIRRORS_V2)} mirrors with health tracking\n"
+                   f"🍪 Cookie-warmed identities ({YAHOO_UB_POOL_SIZE} pool)\n"
+                   f"⏱ Human timing (Gaussian + bimodal)\n"
+                   f"🔁 Auto identity rotation on heat signals")
+        else:
+            msg = "⏸ Yahoo Unblockable DISABLED (using standard fetch)"
+        try:
+            await query.edit_message_text(msg, reply_markup=main_menu_keyboard(sess))
+        except Exception: pass
+        return
+
+    if data == "m_filter":
+        try:
+            await query.edit_message_text(
+                f"🛡 SQL FILTER\nCurrent: ≥{sess.get('min_score', 30)}\n"
+                f"Higher = stricter / fewer URLs but better quality.\n\n"
+                f"Pick a threshold:",
+                reply_markup=filter_keyboard(),
+            )
+        except Exception: pass
+        return
+
+    if data == "m_clean":
+        try:
+            await query.edit_message_text(
+                "🧹 URL CLEANER\n━━━━━━━━━━━━━━━\n"
+                "Upload a .txt with URLs (auto-detected).\n"
+                "Removes: blocked domains, no-query, >200 chars, dupes, invalid.\n\n"
+                "Or paste a URL list directly in chat.",
+                reply_markup=main_menu_keyboard(sess),
+            )
+        except Exception: pass
+        return
+
+    if data == "m_proxylist":
+        if not _proxy_pool:
+            try:
+                await query.edit_message_text(
+                    "📭 No proxies loaded.\n"
+                    "Use /addproxy or /addproxies to add some.",
+                    reply_markup=main_menu_keyboard(sess),
+                )
+            except Exception: pass
+            return
+        alive = sum(1 for p in _proxy_pool if p["alive"])
+        breakdown = {}
+        for p in _proxy_pool:
+            k = (p["protocol"] or "?").upper()
+            breakdown[k] = breakdown.get(k, 0) + 1
+        lines = [f"🔄 POOL — {len(_proxy_pool)} ({alive} alive)",
+                 "📊 " + ", ".join(f"{k}:{v}" for k, v in breakdown.items()),
+                 "━"*22]
+        for i, p in enumerate(_proxy_pool[:20], start=1):
+            mark = "💚" if p["alive"] else "💀"
+            lat = f"{int(p['latency'])}ms" if p.get("latency") else "—"
+            lines.append(f"{i:>2}. {mark} {proxy_display(p)}  {lat}")
+        if len(_proxy_pool) > 20:
+            lines.append(f"… +{len(_proxy_pool)-20} more (use /proxylist for full)")
+        try:
+            await query.edit_message_text("\n".join(lines),
+                reply_markup=main_menu_keyboard(sess))
+        except Exception: pass
+        return
+
+    if data == "m_proxycheck":
+        if not _proxy_pool:
+            try:
+                await query.edit_message_text("📭 No proxies to check.",
+                    reply_markup=main_menu_keyboard(sess))
+            except Exception: pass
+            return
+        try:
+            await query.edit_message_text(f"🔍 Re-checking {len(_proxy_pool)} proxies...")
+        except Exception: pass
+        last_edit = [0.0]
+        async def _progress(done, total, alive):
+            if time.monotonic() - last_edit[0] < 2.5: return
+            try:
+                await query.edit_message_text(
+                    f"🔍 {int(done/total*100)}%\n✅ {done}/{total}\n💚 Alive: {alive}")
+                last_edit[0] = time.monotonic()
+            except Exception: pass
+        alive, dead = await check_proxies_bulk(list(_proxy_pool), progress_cb=_progress)
+        _persist_proxies()
+        try:
+            await query.edit_message_text(
+                f"✅ Check done\n📦 {len(_proxy_pool)} | 💚 {alive} | 💀 {dead}",
+                reply_markup=main_menu_keyboard(sess))
+        except Exception: pass
+        return
+
+    if data == "m_status":
+        job = active_jobs.get(chat_id)
+        running = bool(job and not job.done())
+        if sess.get("xtream"):   mode = "⚡ XTREAM (1000 RPS)"
+        elif sess.get("yahoo_ub"): mode = "🛡 Yahoo Unblockable"
+        else:                      mode = "🕷 Standard (~200 RPS)"
+        try:
+            await query.edit_message_text(
+                f"📊 STATUS\n━━━━━━━━━━━━━━━\n"
+                f"State  : {'⚡ Running' if running else '💤 Idle'}\n"
+                f"Mode   : {mode}\n"
+                f"Tor    : {'ON' if sess.get('tor') else 'OFF'}\n"
+                f"Y-UB   : {'ON 🛡' if sess.get('yahoo_ub') else 'OFF'}\n"
+                f"Filter : ≥{sess.get('min_score', 30)}",
+                reply_markup=main_menu_keyboard(sess),
+            )
+        except Exception: pass
+        return
+
+    if data == "m_help":
+        try:
+            await query.edit_message_text(
+                "📖 HELP — v22.0\n━━━━━━━━━━━━━━━\n"
+                "/dork <q>        — search\n"
+                "/xtream          — toggle 1000 RPS mode\n"
+                "/yahoo_ub on|off — Yahoo Unblockable\n"
+                "/dorkcheck       — validate dork\n"
+                "/mutate          — generate variations\n"
+                "/pages           — page selector\n"
+                "/workers N       — 1-60\n"
+                "/chunks N        — 1-8\n"
+                "/engine X        — bing|yahoo|ddg|all\n"
+                "/tor             — toggle Tor\n"
+                "/filter N        — SQL score ≥ N\n"
+                "/stop            — stop job\n\n"
+                "Proxies:\n"
+                "/addproxy /addproxies /proxylist\n"
+                "/proxycheck /proxyclean /testproxy\n"
+                "/removeproxy [i]",
+                reply_markup=main_menu_keyboard(sess),
+            )
+        except Exception: pass
+        return
+
+    if data == "m_back":
+        try:
+            await query.edit_message_text(
+                "🕷 DORK PARSER v22.0 — YAHOO UNBLOCKABLE",
+                reply_markup=main_menu_keyboard(sess),
+            )
+        except Exception: pass
+        return
+
+    # Fallback for unknown callback
+    log.warning(f"[CB] Unknown callback: {data}")
+    try:
+        await query.answer(f"Unknown action: {data}", show_alert=True)
+    except Exception: pass
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    if not BOT_TOKEN:
+        log.critical("BOT_TOKEN not set!")
+        raise SystemExit(1)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Core commands
+    for name, handler in [
+        ("start",     cmd_start),
+        ("help",      cmd_settings),
+        ("dork",      cmd_dork),
+        ("xtream",    cmd_xtream),
+        ("yahoo_ub",  cmd_yahoo_ub),       # NEW v22
+        ("dorkcheck", cmd_dorkcheck),
+        ("mutate",    cmd_mutate),
+        ("clean",     cmd_clean),
+        ("pages",     cmd_pages),
+        ("tor",       cmd_tor),
+        ("filter",    cmd_filter),
+        ("settings",  cmd_settings),
+        ("workers",   cmd_workers),
+        ("chunks",    cmd_chunks),
+        ("maxres",    cmd_maxres),
+        ("engine",    cmd_engine),
+        ("stop",      cmd_stop),
+        ("status",    cmd_status),
+    ]:
+        app.add_handler(CommandHandler(name, handler))
+
+    # Proxy commands
+    for name, handler in [
+        ("addproxy",    cmd_addproxy),
+        ("addproxies",  cmd_addproxies),
+        ("removeproxy", cmd_removeproxy),
+        ("proxylist",   cmd_proxylist),
+        ("testproxy",   cmd_testproxy),
+        ("proxycheck",  cmd_proxycheck),
+        ("proxyclean",  cmd_proxyclean),
+    ]:
+        app.add_handler(CommandHandler(name, handler))
+
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    async def _on_startup(_app):
+        start_proxy_health_monitor()
+        log.info("Background proxy health monitor started")
+    app.post_init = _on_startup
+
+    log.info("=" * 60)
+    log.info("  DORK PARSER v22.0 — YAHOO UNBLOCKABLE EDITION")
+    log.info(f"  TLS profiles  : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
+    log.info(f"  Anti-block    : circuit-breaker | gaussian jitter | XFF spoof | param vary")
+    log.info(f"  Yahoo UB      : {len(YAHOO_MIRRORS_V2)} mirrors | identity pool ({YAHOO_UB_POOL_SIZE}) | human timing")
+    log.info(f"  Standard      : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
+    log.info(f"  Xtream        : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
+    log.info(f"  Xtream pages  : {XTREAM_PAGES_PER_DORK}/dork | pool: {XTREAM_SESSION_POOL_SIZE}")
+    log.info(f"  Cookie seed   : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
+    log.info(f"  Proxies       : {len(_proxy_pool)} loaded")
+    log.info(f"  Engines       : {', '.join(ENGINES)}")
+    log.info("=" * 60)
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
     main()
