@@ -72,6 +72,17 @@ EMPTY_RATE_SLOWDOWN  = 0.60                                         # ↑ tolera
 EMPTY_RATE_RECOVER   = 0.40
 CHUNK_STAGGER_DELAY  = (0.1, 0.4)                                   # ↓ from (0.8, 2.5)
 
+# ─── YAHOO WORKER WAVE CONFIG (Normal Bulk / Mass Parser Mode) ────────────────
+# Instead of firing all N workers at Yahoo simultaneously (brute-force flood),
+# workers are launched in sequential waves of YAHOO_WORKER_WAVE_SIZE.
+# e.g. 25 workers → 5 waves of 5: [W0-4] → pause → [W5-9] → … → [W20-24]
+# Each wave starts only after the previous wave is already pulling from the queue,
+# so Yahoo sees a steady stream instead of a sudden burst → fewer timeouts,
+# continuous URL collection at full speed.
+YAHOO_WORKER_WAVE_SIZE    = 5          # workers per wave (5,5,5,5,5 for 25 total)
+YAHOO_WAVE_LAUNCH_DELAY   = (1.0, 2.0) # seconds between launching each wave
+YAHOO_INTRA_WAVE_DELAY    = (0.15, 0.35) # micro-stagger between workers inside a wave
+
 # ─── XTREAM MODE CONFIG ──────────────────────────────────────────────────────
 XTREAM_WORKERS_PER_CHUNK   = 50      # parallel workers per chunk
 XTREAM_CHUNKS              = 8       # parallel chunks
@@ -2556,14 +2567,22 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
-                       session, min_score, stop_ev, slowdown_ev, yahoo_pool=None):
+                       session, min_score, stop_ev, slowdown_ev, yahoo_pool=None,
+                       startup_delay: float = 0.0):
     """
     Normal-mode dork worker.
     When `yahoo_pool` is provided and the assigned engine is Yahoo, the worker
     uses `fetch_all_pages_yahoo_adv` (advanced TLS rotation) instead of the
     standard single-session fetch.  All other engines continue to use the
     shared chunk session unchanged.
+
+    startup_delay: seconds to wait before pulling the first dork from the queue.
+    Used by wave-based dispatch so workers in later waves don't race with
+    the earlier waves on Yahoo — gives continuous pipelined URL collection
+    instead of a single burst.
     """
+    if startup_delay > 0:
+        await asyncio.sleep(startup_delay)
     eidx = wid % len(engines)
     empty_streak = consecutive_hits = 0
     while not stop_ev.is_set():
@@ -2634,10 +2653,37 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
         while not stop_ev.is_set():
             if global_stop_ev.is_set(): stop_ev.set()
             await asyncio.sleep(0.5)
-    worker_tasks = [asyncio.create_task(dork_worker(i, chunk_id, queue, results_q,
-                    engines, pages, max_res, session, min_score, stop_ev, slowdown_ev,
-                    yahoo_pool=yahoo_pool))
-                    for i in range(workers_n)]
+
+    # ── Wave-based worker launch for Yahoo (5→5→5→5→5 pattern) ───────────────
+    # When Yahoo is included, launch workers in sequential waves of
+    # YAHOO_WORKER_WAVE_SIZE instead of all-at-once (brute-force flood).
+    # Each worker in a later wave gets a startup_delay so it doesn't race
+    # with earlier waves on Yahoo's servers → no timeout flood, continuous
+    # URL collection at full speed.
+    use_yahoo_waves = "yahoo" in engines
+    wave_size = YAHOO_WORKER_WAVE_SIZE if use_yahoo_waves else workers_n
+    worker_tasks = []
+    for wave_start in range(0, workers_n, wave_size):
+        wave_end = min(wave_start + wave_size, workers_n)
+        wave_id  = wave_start // wave_size
+        # Intra-wave micro-stagger so workers within the same wave don't all
+        # fire at the exact same millisecond
+        for i in range(wave_start, wave_end):
+            intra_offset = (i - wave_start) * random.uniform(*YAHOO_INTRA_WAVE_DELAY)
+            startup = (wave_id * random.uniform(*YAHOO_WAVE_LAUNCH_DELAY)
+                       + intra_offset) if use_yahoo_waves else 0.0
+            worker_tasks.append(asyncio.create_task(
+                dork_worker(i, chunk_id, queue, results_q,
+                            engines, pages, max_res, session, min_score,
+                            stop_ev, slowdown_ev, yahoo_pool=yahoo_pool,
+                            startup_delay=startup)
+            ))
+        # Log wave launch (helps with debugging)
+        if use_yahoo_waves:
+            log.info(f"[C{chunk_id}] Yahoo wave {wave_id+1}/{-(-workers_n//wave_size)}"
+                     f" — workers {wave_start}-{wave_end-1} scheduled"
+                     f" (startup +{wave_id * YAHOO_WAVE_LAUNCH_DELAY[0]:.1f}s..)")
+
     global_watcher = asyncio.create_task(_watch_global())
     try:
         while processed < total and not stop_ev.is_set():
@@ -2728,8 +2774,19 @@ async def run_dork_job(chat_id, dorks, context):
     else: proxy_info = "🔓 Direct"
 
     yahoo_adv = "yahoo" in engines
+    # Wave pattern description for Yahoo (e.g. "5×5 waves" for 25 workers)
+    if yahoo_adv and workers_n > YAHOO_WORKER_WAVE_SIZE:
+        n_waves    = -(-workers_n // YAHOO_WORKER_WAVE_SIZE)   # ceil division
+        wave_label = f"{YAHOO_WORKER_WAVE_SIZE}×{n_waves} waves"
+    else:
+        wave_label = None
+    workers_line = (
+        f"⚙️ Workers  : {workers_n}/chunk → {wave_label} (Yahoo seq)\n"
+        if wave_label else
+        f"⚙️ Workers  : {workers_n}/chunk (total {workers_n*actual_chunks})\n"
+    )
     tls_line  = (f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n"
-                 f"⚡ Yahoo    : ADV-TLS | 15 mirrors | cookie-seeded\n"
+                 f"⚡ Yahoo    : ADV-TLS | 15 mirrors | wave-dispatch\n"
                  if yahoo_adv else
                  f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n")
     status_msg = await context.bot.send_message(
@@ -2739,7 +2796,7 @@ async def run_dork_job(chat_id, dorks, context):
         + (f" (⚠️ {len(invalid_dorks)} skip)" if invalid_dorks else "")
         + f"\n📄 Pages    : {pages_str}\n"
         f"⚡ Chunks   : {actual_chunks}\n"
-        f"⚙️ Workers  : {workers_n}/chunk (total {workers_n*actual_chunks})\n"
+        + workers_line +
         f"🔍 Engines  : {' + '.join(e.upper() for e in engines)}\n"
         f"🛡 Filter   : SQL ≥{min_score}\n"
         f"🌐 Network  : {proxy_info}\n"
