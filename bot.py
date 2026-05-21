@@ -3346,4 +3346,5 @@ async def handle_callback(update, context):
         except Exception: pass
         return
 
-    if data == "m_y    
+    if__name__ == "__main__":
+    main()
