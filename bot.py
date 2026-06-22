@@ -1,11 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   DORK PARSER BOT v20.0 — XTREAM EDITION                         ║
+║   DORK PARSER BOT v24.0 — XTREAM EDITION                         ║
 ║   • FIXED inline keyboard buttons (full handler coverage)        ║
 ║   • ADVANCED TLS fingerprint rotation (12 profiles, per-request) ║
 ║   • SPEED BOOST: 200 URLs/sec standard mode                      ║
 ║   • NEW /xtream mode: 1000 URLs/sec Yahoo bruteforce collector   ║
-║   • All v19.0 features preserved                                 ║
+║   • TTL Memory Management for user sessions & jobs               ║
+║   • Watchdog anti-stall system for workers                       ║
+║   • Telegram API RetryAfter safe edits                           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -14,25 +16,42 @@ import random
 import re
 import os
 import time
+import json as _json
 import logging
+import logging.handlers
 import tempfile
 import shlex
 import itertools
-from collections import deque
+import hashlib as _hashlib
+from collections import deque, Counter
+import array, math
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote, quote_plus
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus, urlencode
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi import CurlError
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+
+# Memory-safe caches
+try:
+    from cachetools import TTLCache
+    user_sessions: TTLCache = TTLCache(maxsize=1000, ttl=3600)
+    active_jobs: TTLCache = TTLCache(maxsize=100, ttl=7200)
+except ImportError:
+    # Fallback if cachetools is not installed
+    user_sessions = {}
+    active_jobs = {}
+
+active_stop_evs: dict = {}
 
 load_dotenv(override=False)
 
@@ -42,20 +61,25 @@ log_file = f"logs/bot_{datetime.now().strftime('%Y%m%d')}.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
-    handlers=[logging.FileHandler(log_file), logging.StreamHandler()],
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        ),
+        logging.StreamHandler(),
+    ],
 )
 log = logging.getLogger(__name__)
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────────────
 BOT_TOKEN             = os.environ.get("BOT_TOKEN", "")
-N_CHUNKS              = int(os.environ.get("N_CHUNKS", 4))         # ↑ from 2
-WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 25)) # ↑ from 8
-MAX_WORKERS_PER_CHUNK = 60                                          # ↑ from 20
-MIN_DELAY             = float(os.environ.get("MIN_DELAY", 0.2))    # ↓ from 1.5
-MAX_DELAY             = float(os.environ.get("MAX_DELAY", 0.6))    # ↓ from 3.0
-FAST_MIN_DELAY        = 0.05                                        # ↓ from 0.5
-FAST_MAX_DELAY        = 0.15                                        # ↓ from 1.0
-FAST_STREAK_THRESHOLD = 2                                           # ↓ from 3
+N_CHUNKS              = int(os.environ.get("N_CHUNKS", 4))
+WORKERS_PER_CHUNK     = int(os.environ.get("WORKERS_PER_CHUNK", 25))
+MAX_WORKERS_PER_CHUNK = 60
+MIN_DELAY             = float(os.environ.get("MIN_DELAY", 0.2))
+MAX_DELAY             = float(os.environ.get("MAX_DELAY", 0.6))
+FAST_MIN_DELAY        = 0.05
+FAST_MAX_DELAY        = 0.15
+FAST_STREAK_THRESHOLD = 2
 MAX_RESULTS           = int(os.environ.get("MAX_RESULTS", 10))
 TOR_PROXY             = os.environ.get("TOR_PROXY", "socks5://127.0.0.1:9050")
 OUTPUT_DIR            = Path("results")
@@ -64,29 +88,29 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 ENGINES   = ["bing", "yahoo", "duckduckgo"]
 MAX_PAGES = 70
 
-WORKER_FETCH_TIMEOUT = 60                                           # ↓ from 120
+WORKER_FETCH_TIMEOUT = 60
 JOB_TIMEOUT          = 30 * 60
-MAX_RETRIES          = 2                                            # ↓ from 3
-CHUNK_STALL_TIMEOUT  = 30.0                                         # ↓ from 60
-EMPTY_RATE_SLOWDOWN  = 0.60                                         # ↑ tolerance
+MAX_RETRIES          = 2
+CHUNK_STALL_TIMEOUT  = 30.0
+EMPTY_RATE_SLOWDOWN  = 0.60
 EMPTY_RATE_RECOVER   = 0.40
-CHUNK_STAGGER_DELAY  = (0.1, 0.4)                                   # ↓ from (0.8, 2.5)
+CHUNK_STAGGER_DELAY  = (0.1, 0.4)
 
 # ─── XTREAM MODE CONFIG ──────────────────────────────────────────────────────
-XTREAM_WORKERS_PER_CHUNK   = 50      # parallel workers per chunk
-XTREAM_CHUNKS              = 8       # parallel chunks
-XTREAM_MIN_DELAY           = 0.01    # almost no delay
+XTREAM_WORKERS_PER_CHUNK   = 50
+XTREAM_CHUNKS              = 8
+XTREAM_MIN_DELAY           = 0.01
 XTREAM_MAX_DELAY           = 0.05
-XTREAM_TIMEOUT             = 20      # increased for reliability
-XTREAM_MAX_RETRIES         = 2       # extra retry before giving up
-XTREAM_TARGET_RPS          = 1000    # target requests/sec
-XTREAM_PAGES_PER_DORK      = 8       # deeper per-dork crawl
-XTREAM_SESSION_POOL_SIZE   = 200     # pre-warmed session pool
-XTREAM_SESSION_MAX_USES    = 30      # rotate session after N uses
-XTREAM_SESSION_MAX_AGE     = 240     # rotate session after 4 minutes
-XTREAM_POOL_BATCH_SIZE     = 20      # parallel batch size during pool init
-XTREAM_CAPTCHA_RATE_LIMIT  = 0.25    # throttle concurrency if captcha rate > 25%
-XTREAM_PRESEED_COOKIES     = True    # visit homepage to warm cookies before searching
+XTREAM_TIMEOUT             = 20
+XTREAM_MAX_RETRIES         = 2
+XTREAM_TARGET_RPS          = 1000
+XTREAM_PAGES_PER_DORK      = 8
+XTREAM_SESSION_POOL_SIZE   = 200
+XTREAM_SESSION_MAX_USES    = 30
+XTREAM_SESSION_MAX_AGE     = 240
+XTREAM_POOL_BATCH_SIZE     = 20
+XTREAM_CAPTCHA_RATE_LIMIT  = 0.25
+XTREAM_PRESEED_COOKIES     = True
 
 DEFAULT_SESSION = {
     "workers":       WORKERS_PER_CHUNK,
@@ -97,318 +121,165 @@ DEFAULT_SESSION = {
     "tor":           False,
     "min_score":     30,
     "xtream":        False,
-    "xtream_engine": "yahoo",  # yahoo | bing | both
+    "xtream_engine": "yahoo",
 }
 
-user_sessions:   dict = {}
-active_jobs:     dict = {}
-active_stop_evs: dict = {}
+# ─── ACCESS CONTROL ──────────────────────────────────────────────────────────
+_ALLOWED_RAW = os.environ.get("ALLOWED_USERS", "").strip()
+ALLOWED_USERS: set[int] = (
+    {int(u.strip()) for u in _ALLOWED_RAW.split(",") if u.strip().isdigit()}
+    if _ALLOWED_RAW else set()
+)
 
+def is_allowed(update) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    user = update.effective_user
+    return user is not None and user.id in ALLOWED_USERS
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── ADVANCED TLS FINGERPRINT ROTATION v21.0 ─────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Full browser impersonation at TLS/JA3/ALPN + HTTP header layer.
-# 22+ profiles spanning Chrome, Firefox, Edge, Safari across Windows/macOS/
-# Linux/Android/iOS. Each profile carries the exact Accept, Accept-Encoding,
-# Priority, and Sec-CH-UA values the real browser sends so every layer of
-# fingerprinting is consistent.
-# ══════════════════════════════════════════════════════════════════════════════
+async def deny_unauthorized(update) -> None:
+    user = update.effective_user
+    uid  = user.id if user else "?"
+    name = user.username or user.first_name if user else "unknown"
+    log.warning(f"[AUTH] Unauthorized access attempt: uid={uid} name={name}")
+    msg = update.effective_message
+    if msg:
+        await safe_edit_or_send(msg, "⛔ Unauthorized. Contact the bot owner.")
 
-# Diverse Accept-Language pool — real users have different browser locales
+# ─── TELEGRAM API SAFE EDIT ──────────────────────────────────────────────────
+async def safe_edit_message(context, chat_id, message_id, text, reply_markup=None):
+    """Safely edits a message, handling Telegram RetryAfter rate limits."""
+    for attempt in range(3):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=text, reply_markup=reply_markup
+            )
+            return
+        except RetryAfter as e:
+            log.warning(f"[TG] Rate limited. Retrying after {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+        except TelegramError as e:
+            if "message is not modified" in str(e).lower():
+                return
+            log.debug(f"[TG] Edit error: {e}")
+            return
+        except Exception:
+            return
+
+# ─── TLS FINGERPRINT ROTATION ────────────────────────────────────────────────
 _LANG_POOL = [
-    "en-US,en;q=0.9",
-    "en-US,en;q=0.9,es;q=0.8",
-    "en-GB,en;q=0.9",
-    "en-CA,en;q=0.9,fr-CA;q=0.8",
-    "en-AU,en;q=0.9",
-    "en-US,en;q=0.8,de;q=0.7",
-    "en-US,en;q=0.9,fr;q=0.8",
-    "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-    "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "es-ES,es;q=0.9,en;q=0.8",
-    "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7",
-    "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "en-IN,en-GB;q=0.9,en;q=0.8",
-    "en-SG,en;q=0.9",
-    "en-NZ,en;q=0.9",
+    "en-US,en;q=0.9", "en-US,en;q=0.9,es;q=0.8", "en-GB,en;q=0.9", "en-CA,en;q=0.9,fr-CA;q=0.8",
+    "en-AU,en;q=0.9", "en-US,en;q=0.8,de;q=0.7", "en-US,en;q=0.9,fr;q=0.8", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7", "es-ES,es;q=0.9,en;q=0.8", "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7", "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7", "en-IN,en-GB;q=0.9,en;q=0.8",
+    "en-SG,en;q=0.9", "en-NZ,en;q=0.9",
 ]
 
-# Per-browser Accept header strings (must match the impersonate target exactly)
 _ACCEPT_CHROME  = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 _ACCEPT_FIREFOX = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 _ACCEPT_SAFARI  = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 _ACCEPT_EDGE    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 
+# ─── BLOOM FILTER ────────────────────────────────────────────────────────────
+class BloomFilter:
+    __slots__ = ("_bits", "_size", "_k", "capacity", "error_rate")
+
+    def __init__(self, capacity: int = 1_000_000, error_rate: float = 0.01):
+        self.capacity   = max(capacity, 1_000)
+        self.error_rate = error_rate
+        n = self.capacity
+        p = error_rate
+        self._size = max(int(-n * math.log(p) / (math.log(2) ** 2)), 64)
+        self._k    = max(int((self._size / n) * math.log(2)), 1)
+        self._bits = array.array("B", b"\x00" * ((self._size + 7) // 8))
+
+    def _positions(self, item: str):
+        raw    = item.encode("utf-8", errors="replace")
+        digest = _hashlib.sha256(raw).digest()
+        h1 = int.from_bytes(digest[0:4],   "little") % self._size
+        h2 = int.from_bytes(digest[8:12],  "little") % self._size or 1
+        h3 = int.from_bytes(digest[16:20], "little") % self._size
+        h4 = int.from_bytes(digest[24:28], "little") % self._size or 1
+        for i in range(self._k):
+            yield ((h1 + i * h2) ^ (h3 + i * h4)) % self._size
+
+    def add(self, item: str) -> bool:
+        seen = True
+        for pos in self._positions(item):
+            byte_i, bit_i = divmod(pos, 8)
+            if not (self._bits[byte_i] >> bit_i & 1):
+                seen = False
+                self._bits[byte_i] |= (1 << bit_i)
+        return seen
+
+    def __contains__(self, item: str) -> bool:
+        return all(
+            (self._bits[pos >> 3] >> (pos & 7)) & 1
+            for pos in self._positions(item)
+        )
+
+    @property
+    def memory_mb(self) -> float:
+        return len(self._bits) / 1_048_576
+
+# ─── TLS PROFILES (Inlined for deployment simplicity) ────────────────────────
+# Note: To reduce file size, move this array to tls_profiles.json and load it
 TLS_PROFILES = [
-    # ── Chrome 110 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome110", "browser": "chrome", "version": 110,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Chrome 116 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome116", "browser": "chrome", "version": 116,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not)A;Brand";v="24", "Chromium";v="116", "Google Chrome";v="116"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Chrome 119 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome119", "browser": "chrome", "version": 119,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Chrome 120 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome120", "browser": "chrome", "version": 120,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Chrome 123 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome123", "browser": "chrome", "version": 123,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-    },
-    # ── Chrome 124 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome124", "browser": "chrome", "version": 124,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "priority": "u=0, i",
-    },
-    # ── Chrome 126 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome126", "browser": "chrome", "version": 126,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="8"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "priority": "u=0, i",
-    },
-    # ── Chrome 131 · Windows ────────────────────────────────────────────────
-    {
-        "impersonate": "chrome131", "browser": "chrome", "version": 131,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"Windows"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "priority": "u=0, i",
-    },
-    # ── Chrome 131 · macOS ──────────────────────────────────────────────────
-    {
-        "impersonate": "chrome131", "browser": "chrome", "version": 131,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "priority": "u=0, i",
-    },
-    # ── Chrome 131 · Linux ──────────────────────────────────────────────────
-    {
-        "impersonate": "chrome131", "browser": "chrome", "version": 131,
-        "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"Linux"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "priority": "u=0, i",
-    },
-    # ── Chrome 120 · macOS ──────────────────────────────────────────────────
-    {
-        "impersonate": "chrome120", "browser": "chrome", "version": 120,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"macOS"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Chrome 131 · Android (Pixel 8) ──────────────────────────────────────
-    {
-        "impersonate": "chrome131", "browser": "chrome", "version": 131,
-        "ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"Android"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "mobile": True, "priority": "u=0, i",
-    },
-    # ── Chrome 120 · Android (Samsung) ──────────────────────────────────────
-    {
-        "impersonate": "chrome120", "browser": "chrome", "version": 120,
-        "ua": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
-        "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "platform": '"Android"', "accept": _ACCEPT_CHROME,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-        "mobile": True,
-    },
-    # ── Edge 99 · Windows ───────────────────────────────────────────────────
-    {
-        "impersonate": "edge99", "browser": "edge", "version": 99,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36 Edg/99.0.1150.55",
-        "sec_ch_ua": '"Microsoft Edge";v="99", "Chromium";v="99", "Not;A=Brand";v="24"',
-        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Edge 101 · Windows ──────────────────────────────────────────────────
-    {
-        "impersonate": "edge101", "browser": "edge", "version": 101,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.54 Safari/537.36 Edg/101.0.1210.39",
-        "sec_ch_ua": '"Microsoft Edge";v="101", "Chromium";v="101", "Not;A=Brand";v="24"',
-        "platform": '"Windows"', "accept": _ACCEPT_EDGE,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-        "priority": "u=0, i",
-    },
-    # ── Safari 15.5 · macOS ─────────────────────────────────────────────────
-    {
-        "impersonate": "safari15_5", "browser": "safari", "version": 155,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Safari 17.0 · macOS ─────────────────────────────────────────────────
-    {
-        "impersonate": "safari17_0", "browser": "safari", "version": 170,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Safari 18.0 · macOS ─────────────────────────────────────────────────
-    {
-        "impersonate": "safari18_0", "browser": "safari", "version": 180,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
-        "sec_ch_ua": None,
-        "platform": '"macOS"', "accept": _ACCEPT_SAFARI,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-    },
-    # ── Safari 17.2 · iOS ───────────────────────────────────────────────────
-    {
-        "impersonate": "safari17_2_ios", "browser": "safari", "version": 172,
-        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-        "sec_ch_ua": None,
-        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-        "mobile": True,
-    },
-    # ── Safari 18.0 · iOS ───────────────────────────────────────────────────
-    {
-        "impersonate": "safari18_0", "browser": "safari", "version": 180,
-        "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
-        "sec_ch_ua": None,
-        "platform": '"iOS"', "accept": _ACCEPT_SAFARI,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br",
-        "mobile": True,
-    },
-    # ── Firefox 133 · Windows ───────────────────────────────────────────────
-    {
-        "impersonate": "firefox133", "browser": "firefox", "version": 133,
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "sec_ch_ua": None,
-        "platform": None, "accept": _ACCEPT_FIREFOX,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "firefox": True,
-    },
-    # ── Firefox 133 · Linux ─────────────────────────────────────────────────
-    {
-        "impersonate": "firefox133", "browser": "firefox", "version": 133,
-        "ua": "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "sec_ch_ua": None,
-        "platform": None, "accept": _ACCEPT_FIREFOX,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "firefox": True,
-    },
-    # ── Firefox 133 · macOS ─────────────────────────────────────────────────
-    {
-        "impersonate": "firefox133", "browser": "firefox", "version": 133,
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "sec_ch_ua": None,
-        "platform": None, "accept": _ACCEPT_FIREFOX,
-        "accept_lang": random.choice(_LANG_POOL), "accept_enc": "gzip, deflate, br, zstd",
-        "firefox": True,
-    },
+    {"impersonate": "chrome120", "browser": "chrome", "version": 120, "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "sec_ch_ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"', "platform": '"Windows"', "accept": _ACCEPT_CHROME, "accept_enc": "gzip, deflate, br"},
+    {"impersonate": "chrome131", "browser": "chrome", "version": 131, "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', "platform": '"Windows"', "accept": _ACCEPT_CHROME, "accept_enc": "gzip, deflate, br, zstd", "priority": "u=0, i"},
+    {"impersonate": "chrome131", "browser": "chrome", "version": 131, "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', "platform": '"macOS"', "accept": _ACCEPT_CHROME, "accept_enc": "gzip, deflate, br, zstd", "priority": "u=0, i"},
+    {"impersonate": "edge122", "browser": "edge", "version": 122, "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0", "sec_ch_ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Microsoft Edge";v="122"', "platform": '"Windows"', "accept": _ACCEPT_EDGE, "accept_enc": "gzip, deflate, br, zstd", "priority": "u=0, i"},
+    {"impersonate": "safari17_0", "browser": "safari", "version": 170, "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", "sec_ch_ua": None, "platform": '"macOS"', "accept": _ACCEPT_SAFARI, "accept_enc": "gzip, deflate, br"},
+    {"impersonate": "firefox133", "browser": "firefox", "version": 133, "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0", "sec_ch_ua": None, "platform": None, "accept": _ACCEPT_FIREFOX, "accept_enc": "gzip, deflate, br, zstd", "firefox": True},
 ]
 
-# Cycling iterator (thread-safe ish — used as a hint only)
 _tls_cycle = itertools.cycle(TLS_PROFILES)
-_tls_lock  = asyncio.Lock()
-_tls_last  = []         # tracks last N profiles used to avoid consecutive repeats
-_TLS_ANTI_REPEAT = 3   # don't repeat same impersonate within this window
-
+_tls_last: list[str] = []
+_TLS_ANTI_REPEAT = 3
 
 def get_tls_profile(strategy: str = "random") -> dict:
-    """
-    Get a TLS profile.
-      - "random"   : uniform random with anti-repeat window (best for diversity)
-      - "round"    : strict round-robin (predictable distribution)
-      - "weighted" : market-share weighted (Chrome dominant, Firefox included)
-    """
     global _tls_last
     if strategy == "round":
         return next(_tls_cycle)
 
     if strategy == "weighted":
-        # Realistic 2025 browser market share weights
         r = random.random()
         if r < 0.62:
-            pool = [p for p in TLS_PROFILES if p["browser"] == "chrome" and not p.get("mobile")]
+            pool = [p for p in TLS_PROFILES if p["browser"] == "chrome"]
         elif r < 0.72:
             pool = [p for p in TLS_PROFILES if p["browser"] == "firefox"]
         elif r < 0.80:
             pool = [p for p in TLS_PROFILES if p["browser"] == "edge"]
-        elif r < 0.90:
-            pool = [p for p in TLS_PROFILES if p["browser"] == "safari" and not p.get("mobile")]
         else:
-            pool = [p for p in TLS_PROFILES if p.get("mobile")]
+            pool = [p for p in TLS_PROFILES if p["browser"] == "safari"]
         candidates = pool or TLS_PROFILES
     else:
         candidates = TLS_PROFILES
 
-    # Anti-repeat: exclude profiles whose impersonate was recently used
     recent = set(_tls_last[-_TLS_ANTI_REPEAT:])
     filtered = [p for p in candidates if p["impersonate"] not in recent]
     chosen = random.choice(filtered if filtered else candidates)
 
-    # Update anti-repeat window
     _tls_last.append(chosen["impersonate"])
     if len(_tls_last) > _TLS_ANTI_REPEAT * 2:
         _tls_last = _tls_last[-_TLS_ANTI_REPEAT:]
     return chosen
 
-
 def build_headers_from_profile(profile: dict, referer: str | None = None,
-                                origin: str | None = None,
-                                context: str = "navigate") -> dict:
-    """
-    Build a complete, browser-accurate HTTP header set matching the TLS profile.
-    Every field is chosen to be internally consistent with the browser/OS/version.
-    """
+                                origin: str | None = None) -> dict:
     is_firefox = profile.get("firefox", False)
     is_mobile  = profile.get("mobile", False)
     version    = profile.get("version", 120)
     browser    = profile.get("browser", "chrome")
 
-    # Vary Cache-Control realistically (real users have varied cache states)
     cache_ctrl = random.choice(["max-age=0", "max-age=0", "no-cache", "max-age=0"])
 
     if is_firefox:
         h = {
             "User-Agent":              profile["ua"],
             "Accept":                  profile.get("accept", _ACCEPT_FIREFOX),
-            "Accept-Language":         profile["accept_lang"],
+            "Accept-Language":         random.choice(_LANG_POOL),
             "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br, zstd"),
             "Connection":              "keep-alive",
             "Upgrade-Insecure-Requests": "1",
@@ -420,11 +291,10 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
             "Cache-Control":           cache_ctrl,
         }
     else:
-        # Chrome/Edge/Safari
         h = {
             "User-Agent":              profile["ua"],
             "Accept":                  profile.get("accept", _ACCEPT_CHROME),
-            "Accept-Language":         profile["accept_lang"],
+            "Accept-Language":         random.choice(_LANG_POOL),
             "Accept-Encoding":         profile.get("accept_enc", "gzip, deflate, br"),
             "Upgrade-Insecure-Requests": "1",
             "Cache-Control":           cache_ctrl,
@@ -433,98 +303,39 @@ def build_headers_from_profile(profile: dict, referer: str | None = None,
             "Sec-Fetch-Site":          "same-origin" if referer else "none",
             "Sec-Fetch-User":          "?1",
         }
-        # Priority header for Chrome 101+ and Edge 101+
         if version >= 101 and browser in ("chrome", "edge") and "priority" in profile:
             h["Priority"] = profile["priority"]
 
-    # Sec-CH-UA headers for Chromium-based browsers
     if profile.get("sec_ch_ua"):
         h["Sec-Ch-Ua"]          = profile["sec_ch_ua"]
         h["Sec-Ch-Ua-Mobile"]   = "?1" if is_mobile else "?0"
         h["Sec-Ch-Ua-Platform"] = profile["platform"]
-        # Newer Chrome also sends architecture hints ~40% of the time
-        if version >= 120 and random.random() < 0.40:
-            h["Sec-Ch-Ua-Arch"]           = '"x86"' if not is_mobile else '"arm"'
-            h["Sec-Ch-Ua-Bitness"]        = '"64"'
-            h["Sec-Ch-Ua-Full-Version-List"] = profile["sec_ch_ua"]
 
     if referer:
         h["Referer"] = referer
     if origin:
         h["Origin"] = origin
 
-    # DNT: Chrome sends it rarely (<5%), Firefox users ~25%
     dnt_prob = 0.25 if is_firefox else 0.05
     if random.random() < dnt_prob:
         h["DNT"] = "1"
 
-    # Save-Data: ~2% of connections (low-bandwidth users)
-    if random.random() < 0.02:
-        h["Save-Data"] = "on"
-
     return h
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── ANTI-BLOCK SYSTEM v21.0 ─────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Four independent layers work together to defeat bot detection:
-#
-#  1. DomainCircuitBreaker — per-domain state machine that auto-pauses a
-#     domain when its block rate exceeds a threshold and auto-resumes after
-#     a cooldown period.  Workers call `check()` before each request and
-#     `record()` after.
-#
-#  2. humanize_delay()     — Gaussian jitter instead of uniform random sleep.
-#     Real humans don't sleep uniformly; they cluster around a mean with a
-#     natural spread.  Occasional outliers ("distraction breaks") are added.
-#
-#  3. RefererChain         — maintains a per-session chain of plausible
-#     referer URLs so requests look like they come from real navigation.
-#     Includes the search-engine homepage → SERP → result page chain.
-#
-#  4. SearchParamVariator  — randomises minor query-string parameters
-#     (Yahoo fr/b, Bing first/form/count) so each request has a unique
-#     fingerprint even when the dork is the same.
-#
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── ANTI-BLOCK SYSTEM ───────────────────────────────────────────────────────
 import collections as _collections
 
-# ── 1. Per-domain Circuit Breaker ────────────────────────────────────────────
-
 class DomainCircuitBreaker:
-    """
-    Tracks block/success events per target domain and exposes a circuit-breaker
-    that pauses a domain when it is clearly rate-limiting us.
-
-    States:
-      CLOSED  → normal operation
-      OPEN    → domain is paused; workers must wait for cooldown
-      HALF    → cooldown expired; next request is a probe
-
-    Transitions:
-      CLOSED → OPEN  : block_rate >= THRESHOLD over last WINDOW requests
-      OPEN   → HALF  : cooldown_secs elapsed
-      HALF   → CLOSED: probe request succeeded
-      HALF   → OPEN  : probe request was also blocked (extend cooldown ×2)
-    """
-
-    WINDOW        = 20    # sliding window of last N requests
-    THRESHOLD     = 0.55  # 55% block rate triggers OPEN
-    COOLDOWN_BASE = 45.0  # initial cooldown seconds
-    COOLDOWN_MAX  = 480.0 # cap at 8 minutes
+    WINDOW        = 20
+    THRESHOLD     = 0.55
+    COOLDOWN_BASE = 45.0
+    COOLDOWN_MAX  = 480.0
 
     def __init__(self):
         self._lock     = asyncio.Lock()
-        # domain → deque of 1/0 (blocked/ok) for sliding window
         self._history: dict[str, _collections.deque] = {}
-        # domain → state: "closed" | "open" | "half"
         self._state:   dict[str, str]   = {}
-        # domain → time when OPEN expires
         self._until:   dict[str, float] = {}
-        # domain → current cooldown duration (doubles on repeated failures)
         self._cooldown: dict[str, float] = {}
 
     def _domain(self, url: str) -> str:
@@ -534,11 +345,6 @@ class DomainCircuitBreaker:
             return url
 
     async def check(self, url: str) -> float:
-        """
-        Returns 0.0 if the domain is CLOSED (proceed immediately).
-        Returns seconds-to-wait if OPEN.
-        Workers should await asyncio.sleep(result) before the request.
-        """
         domain = self._domain(url)
         async with self._lock:
             state = self._state.get(domain, "closed")
@@ -548,14 +354,11 @@ class DomainCircuitBreaker:
                 remaining = self._until.get(domain, 0) - time.time()
                 if remaining > 0:
                     return remaining
-                # Transition to HALF — allow one probe through
                 self._state[domain] = "half"
                 return 0.0
-            # HALF — probe is in flight, other workers wait briefly
             return 2.0
 
     async def record(self, url: str, blocked: bool) -> None:
-        """Record the outcome of a request for the given URL's domain."""
         domain = self._domain(url)
         async with self._lock:
             if domain not in self._history:
@@ -570,18 +373,14 @@ class DomainCircuitBreaker:
 
             if state == "half":
                 if blocked:
-                    # Probe also blocked → extend cooldown and reopen
                     cd = min(self._cooldown[domain] * 2, self.COOLDOWN_MAX)
                     self._cooldown[domain] = cd
                     self._state[domain]    = "open"
                     self._until[domain]    = time.time() + cd
-                    log.debug(f"[CB] {domain}: probe blocked → OPEN for {cd:.0f}s")
                 else:
-                    # Probe succeeded → reset and close
                     self._state[domain]    = "closed"
                     self._cooldown[domain] = self.COOLDOWN_BASE
                     hist.clear()
-                    log.debug(f"[CB] {domain}: probe OK → CLOSED")
                 return
 
             if len(hist) >= self.WINDOW // 2:
@@ -590,219 +389,148 @@ class DomainCircuitBreaker:
                     cd = self._cooldown[domain]
                     self._state[domain] = "open"
                     self._until[domain] = time.time() + cd
-                    log.warning(f"[CB] {domain}: block rate {rate:.0%} → OPEN for {cd:.0f}s")
 
-
-# Global singleton — shared across all XTREAM workers
 circuit_breaker = DomainCircuitBreaker()
 
+_YAHOO_SUGGEST_URL = "https://search.yahoo.com/sugg/gossip/gossip-us-ura/?output=sd1&appid=fp&command="
 
-# ── 2. Gaussian Jitter Timing ─────────────────────────────────────────────────
+class YahooCaptchaBypassEngine:
+    STRIKE_QUARANTINE: list = [0.0, 20.0, 45.0, 90.0, 180.0, 360.0]
+    STRIKE_MAX   = 5
+    PROBE_TIMEOUT = 4.0
+
+    def __init__(self):
+        self._lock                           = asyncio.Lock()
+        self._strikes:     dict              = {}
+        self._quarantine:  dict              = {}
+        self._captcha_count: dict            = {}
+        self.total_captchas  = 0
+        self.total_bypassed  = 0
+
+    @staticmethod
+    def noise_query(query: str) -> str:
+        if not query:
+            return query
+        r = random.random()
+        if r < 0.10:
+            return query + " "
+        if r < 0.20:
+            words = query.split()
+            for i, w in enumerate(words):
+                if not any(op in w for op in ("inurl:", "intitle:", "site:", "filetype:", "ext:")):
+                    words[i] = w.capitalize() if w.islower() else w.lower()
+                    break
+            return " ".join(words)
+        return query
+
+    async def record_captcha(self, endpoint: str) -> float:
+        async with self._lock:
+            self.total_captchas += 1
+            self._captcha_count[endpoint] = self._captcha_count.get(endpoint, 0) + 1
+            strikes = min(self._strikes.get(endpoint, 0) + 1, self.STRIKE_MAX)
+            self._strikes[endpoint] = strikes
+            q_secs = self.STRIKE_QUARANTINE[strikes]
+            if q_secs > 0:
+                self._quarantine[endpoint] = time.time() + q_secs
+            return q_secs
+
+    async def record_success(self, endpoint: str) -> None:
+        async with self._lock:
+            if self._strikes.get(endpoint, 0) > 0:
+                self._strikes[endpoint] -= 1
+                self.total_bypassed += 1
+
+    async def is_quarantined(self, endpoint: str) -> float:
+        async with self._lock:
+            remaining = self._quarantine.get(endpoint, 0.0) - time.time()
+            return max(0.0, remaining)
+
+    def pick_clean_endpoint(self, exclude: str = "") -> str:
+        candidates = [ep for ep in YAHOO_ENDPOINTS if ep != exclude]
+        if not candidates:
+            candidates = list(YAHOO_ENDPOINTS)
+        now = time.time()
+
+        def _score(ep):
+            return (
+                max(0.0, self._quarantine.get(ep, 0.0) - now),
+                self._strikes.get(ep, 0),
+            )
+
+        candidates.sort(key=_score)
+        return random.choice(candidates[:3])
+
+    async def shadow_probe(self, sess, word: str = "test") -> bool:
+        try:
+            safe_word = quote_plus(word[:10])
+            url       = _YAHOO_SUGGEST_URL + safe_word
+            profile   = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers   = build_headers_from_profile(profile)
+            headers["Accept"]           = "application/json, text/javascript, */*; q=0.01"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            resp = await sess.get(url, headers=headers, timeout=self.PROBE_TIMEOUT)
+            if resp.status_code == 200:
+                txt = resp.text[:256]
+                return '"gossip"' in txt or '"query"' in txt or txt.startswith("{")
+            return False
+        except Exception:
+            return False
+
+yahoo_captcha_bypass = YahooCaptchaBypassEngine()
 
 def humanize_delay(base: float, sigma_ratio: float = 0.30,
                    distraction_prob: float = 0.04,
                    distraction_extra: float = 3.0) -> float:
-    """
-    Return a human-like delay around `base` seconds.
-
-    - Core delay:  Gaussian(mean=base, sigma=base*sigma_ratio), clipped to
-                   [base*0.2, base*4.0]
-    - Distraction: With probability `distraction_prob`, add an extra pause of
-                   Uniform(distraction_extra, distraction_extra*3) — simulates
-                   a user glancing away, switching tabs, etc.
-
-    Example: humanize_delay(1.5) → typically 0.9–2.2 s, rarely up to 10 s
-    """
     delay = random.gauss(base, base * sigma_ratio)
     delay = max(base * 0.2, min(base * 4.0, delay))
     if random.random() < distraction_prob:
         delay += random.uniform(distraction_extra, distraction_extra * 3)
     return delay
 
-
 async def async_humanize_sleep(base: float, **kw) -> None:
-    """async wrapper for humanize_delay — use in coroutines."""
     await asyncio.sleep(humanize_delay(base, **kw))
 
-
-# ── 3. Per-session Referer Chain ──────────────────────────────────────────────
-
-_YAHOO_HOMES  = ["https://search.yahoo.com/", "https://yahoo.com/",
-                 "https://www.yahoo.com/"]
-_BING_HOMES   = ["https://www.bing.com/", "https://bing.com/"]
-_GOOGLE_HOMES = ["https://www.google.com/", "https://google.com/"]
-
-class RefererChain:
-    """
-    Maintains a plausible navigation history for a session so every outgoing
-    request carries a believable Referer that matches the chain:
-
-        Search engine homepage → SERP page → result page → (next SERP)
-
-    Usage:
-        chain = RefererChain("yahoo")
-        referer = chain.next_referer(serp_url)   # before each SERP request
-    """
-
-    def __init__(self, engine: str = "yahoo"):
-        self.engine  = engine
-        self._chain: list[str] = []
-        if engine == "bing":
-            self._chain.append(random.choice(_BING_HOMES))
-        elif engine == "google":
-            self._chain.append(random.choice(_GOOGLE_HOMES))
-        else:
-            self._chain.append(random.choice(_YAHOO_HOMES))
-
-    def push(self, url: str) -> None:
-        """Record a visited URL into the chain (keep last 5)."""
-        self._chain.append(url)
-        if len(self._chain) > 5:
-            self._chain.pop(0)
-
-    def current(self) -> str | None:
-        """Return the most recent URL as a Referer value."""
-        return self._chain[-1] if self._chain else None
-
-    def next_serp_referer(self, serp_url: str) -> str:
-        """
-        Return the referer to use for `serp_url`, then push serp_url
-        into the chain so the next call sees it as referer.
-        """
-        ref = self.current()
-        self.push(serp_url)
-        return ref or ""
-
-
-# ── 4. Search Parameter Variator ─────────────────────────────────────────────
-
-_YAHOO_FR_POOL = [
-    "fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp",
-    "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152",
-]
-_YAHOO_VD_POOL = ["b", ""]   # vertical
-_YAHOO_EI_POOL = ["UTF-8", "utf-8"]
-
+_YAHOO_FR_POOL = ["fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp", "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152"]
+_YAHOO_FR_POOL_ADV = _YAHOO_FR_POOL + ["uh3_search_web", "yfp-t", "yfp-t-s", "yfp-t-501-s", "sb-top", "v9", "yfp-t-900", "uh3_new_design"]
 _BING_FORM_POOL = ["QBLH", "QBRE", "SBSC", "QBHL", "PERE", "ANAB01"]
-_BING_MSBQF_POOL = ["0", "1", ""]   # internal Bing flag
-_BING_COUNT_POOL  = [10, 10, 10, 15, 20]   # most use 10
-
-def vary_yahoo_params(base_params: dict) -> dict:
-    """
-    Add realistic variance to Yahoo search parameters so requests don't look
-    templated.  Modifies a copy; does not mutate the original.
-    """
-    p = dict(base_params)
-    p["fr"]  = random.choice(_YAHOO_FR_POOL)
-    p["ei"]  = random.choice(_YAHOO_EI_POOL)
-    if random.random() < 0.15:
-        p["vd"] = random.choice(_YAHOO_VD_POOL)
-    if random.random() < 0.10:
-        p["age"] = random.choice(["1d", "1w", "1m", ""])
-    if random.random() < 0.08:
-        p["toggle"] = "1"
-    return p
-
-
-# ── Advanced Yahoo Parameter Variance (Normal Bulk Mode) ──────────────────────
-
-_YAHOO_FR_POOL_ADV = [
-    "fp-tts", "yfp-t-902", "yfp-t-501", "free", "p2", "sfp",
-    "uh3_finance_vert_gs", "uh3_finance_vert", "yfp-t-152",
-    "uh3_search_web", "yfp-t", "yfp-t-s", "yfp-t-501-s",
-    "sb-top", "v9", "yfp-t-900", "uh3_new_design",
-]
-_YAHOO_NOL_POOL  = ["1", "0", ""]
-_YAHOO_BTF_POOL  = ["", "1"]
-_YAHOO_NC_POOL   = ["1", ""]
-_YAHOO_INTENT    = ["", "go", "pr"]
-
+_BING_COUNT_POOL  = [10, 10, 10, 15, 20]
 
 def vary_yahoo_params_advanced(base_params: dict) -> dict:
-    """
-    Richer parameter variance for Yahoo in advanced TLS mode.
-    More `fr` values, extra optional params, and mild `b` jitter to
-    prevent caching fingerprints across requests.
-    """
     p = dict(base_params)
     p["fr"]  = random.choice(_YAHOO_FR_POOL_ADV)
-    p["ei"]  = random.choice(_YAHOO_EI_POOL)
-    if random.random() < 0.20:
-        p["vd"] = random.choice(_YAHOO_VD_POOL)
-    if random.random() < 0.12:
-        p["age"] = random.choice(["1d", "1w", "1m", ""])
-    if random.random() < 0.10:
-        p["toggle"] = "1"
-    if random.random() < 0.15:
-        p["nol"] = random.choice(_YAHOO_NOL_POOL)
-    if random.random() < 0.08:
-        p["btf"] = random.choice(_YAHOO_BTF_POOL)
-    if random.random() < 0.10:
-        p["nc"] = random.choice(_YAHOO_NC_POOL)
-    if random.random() < 0.07:
-        p["intent"] = random.choice(_YAHOO_INTENT)
-    # Tiny b-offset jitter on inner pages to bust CDN caching
+    p["ei"]  = random.choice(["UTF-8", "utf-8"])
+    if random.random() < 0.20: p["vd"] = random.choice(["b", ""])
+    if random.random() < 0.12: p["age"] = random.choice(["1d", "1w", "1m", ""])
+    if random.random() < 0.15: p["nol"] = random.choice(["1", "0", ""])
     if random.random() < 0.06 and int(p.get("b", 1)) > 1:
         p["b"] = max(1, int(p["b"]) + random.choice([-1, 0, 1]))
     return p
 
-
 def vary_bing_params(base_params: dict) -> dict:
-    """
-    Add realistic variance to Bing search parameters.
-    """
     p = dict(base_params)
     p["form"]  = random.choice(_BING_FORM_POOL)
     p["count"] = random.choice(_BING_COUNT_POOL)
-    if random.random() < 0.12:
-        p["msbqf"] = random.choice(_BING_MSBQF_POOL)
-    if random.random() < 0.08:
-        p["qpvt"] = p.get("q", "")[:20]
-    if random.random() < 0.10:
-        p["sc"] = f"8-{random.randint(10, 40)}"
     return p
 
-
-# ── 5. X-Forwarded-For Spoofer (optional header noise) ───────────────────────
-
 _COMMON_ISP_RANGES = [
-    # US ISPs / cloud egress ranges (publicly routable, not sensitive)
-    ("24.0.0.0",    "24.255.255.255"),   # Comcast
-    ("71.0.0.0",    "71.127.255.255"),   # AT&T
-    ("98.0.0.0",    "98.255.255.255"),   # Charter/Spectrum
-    ("173.0.0.0",   "173.79.255.255"),   # Comcast Business
-    ("67.40.0.0",   "67.63.255.255"),    # CenturyLink
-    ("50.0.0.0",    "50.127.255.255"),   # Various US cable
-    ("86.0.0.0",    "86.255.255.255"),   # BT / UK
-    ("82.0.0.0",    "82.127.255.255"),   # Deutsche Telekom
-    ("90.0.0.0",    "90.127.255.255"),   # France Telecom
+    ("24.0.0.0",    "24.255.255.255"),
+    ("71.0.0.0",    "71.127.255.255"),
+    ("98.0.0.0",    "98.255.255.255"),
+    ("173.0.0.0",   "173.79.255.255"),
 ]
 
-def _random_public_ip() -> str:
-    r1, r2 = random.choice(_COMMON_ISP_RANGES)
-    parts1 = [int(x) for x in r1.split(".")]
-    parts2 = [int(x) for x in r2.split(".")]
-    ip = ".".join(str(random.randint(a, b)) for a, b in zip(parts1, parts2))
-    return ip
-
 def spoof_xff_headers(h: dict, probability: float = 0.35) -> dict:
-    """
-    With `probability`, inject X-Forwarded-For / X-Real-Ip headers with a
-    plausible residential IP to make the request look like it came from a NAT
-    gateway.  Returns the header dict (modified in-place).
-    """
     if random.random() < probability:
-        ip = _random_public_ip()
+        r1, r2 = random.choice(_COMMON_ISP_RANGES)
+        parts1 = [int(x) for x in r1.split(".")]
+        parts2 = [int(x) for x in r2.split(".")]
+        ip = ".".join(str(random.randint(a, b)) for a, b in zip(parts1, parts2))
         h["X-Forwarded-For"] = ip
         if random.random() < 0.5:
             h["X-Real-Ip"] = ip
     return h
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── PROXY SYSTEM (unchanged from v19.0) ─────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── PROXY SYSTEM ────────────────────────────────────────────────────────────
 PROXY_ENABLED: bool = os.environ.get("PROXY_ENABLED", "true").lower() not in ("false", "0", "no")
 PROXY_PROBE_ORDER = ("socks5", "socks4", "http", "https")
 PROXY_TEST_URLS = [
@@ -826,7 +554,6 @@ _URL_RE          = re.compile(
     r"^(https?|socks4a?|socks5h?)://(?:([^:@/\s]+):([^:@/\s]+)@)?([\w\-\.]+):(\d{1,5})/?$",
     re.IGNORECASE,
 )
-
 
 def parse_proxy_line(line: str) -> dict | None:
     line = line.strip()
@@ -857,18 +584,15 @@ def parse_proxy_line(line: str) -> dict | None:
                 "last_check": 0.0, "fail_count": 0, "explicit": False}
     return None
 
-
 def _build_proxy_url(scheme, host, port, user, pwd):
     auth = f"{user}:{pwd}@" if user and pwd else ""
     return f"{scheme}://{auth}{host}:{port}"
-
 
 def proxy_key(p): return f"{p['host']}:{p['port']}:{p.get('user') or ''}"
 def proxy_display(p):
     proto = p["protocol"].upper() if p["protocol"] else "?"
     auth  = " 🔐" if p.get("user") else ""
     return f"[{proto:6s}] {p['host']}:{p['port']}{auth}"
-
 
 async def _probe_single(host, port, user, pwd, scheme):
     proxy_url = _build_proxy_url(scheme, host, port, user, pwd)
@@ -884,7 +608,6 @@ async def _probe_single(host, port, user, pwd, scheme):
         text = resp.text.strip()
         ext_ip = None
         try:
-            import json as _json
             data = _json.loads(text)
             ext_ip = data.get("ip") or data.get("origin") or data.get("query")
         except Exception:
@@ -898,7 +621,6 @@ async def _probe_single(host, port, user, pwd, scheme):
     finally:
         try: await sess.close()
         except Exception: pass
-
 
 async def detect_proxy_protocol(p):
     host, port = p["host"], p["port"]
@@ -916,12 +638,10 @@ async def detect_proxy_protocol(p):
             p["protocol"]=scheme
             p["url"]=_build_proxy_url(scheme, host, port, user, pwd)
             p["alive"]=True; p["latency"]=latency; p["last_check"]=time.time(); p["fail_count"]=0
-            log.info(f"[PROXY] Detected {scheme.upper()} for {host}:{port} ({latency:.0f}ms)")
             return True
     p["alive"]=False; p["protocol"]=None
     p["last_check"]=time.time(); p["fail_count"]=p.get("fail_count",0)+1
     return False
-
 
 async def check_proxies_bulk(proxies, concurrency=PROXY_CHECK_CONCURRENCY, progress_cb=None):
     sem = asyncio.Semaphore(concurrency)
@@ -938,11 +658,10 @@ async def check_proxies_bulk(proxies, concurrency=PROXY_CHECK_CONCURRENCY, progr
     await asyncio.gather(*[_one(p) for p in proxies], return_exceptions=True)
     return alive, total - alive
 
-
 def _persist_proxies():
     try:
         with open("proxies.txt", "w", encoding="utf-8") as f:
-            f.write(f"# Proxy pool — v20.0\n# Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Proxy pool — v24.0\n# Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"# Total: {len(_proxy_pool)}\n\n")
             for p in _proxy_pool:
                 line = p["url"] if p.get("url") else (
@@ -952,7 +671,6 @@ def _persist_proxies():
                 f.write(line + tag + "\n")
     except Exception as exc:
         log.warning(f"[PROXY] persist fail: {exc}")
-
 
 def _load_proxies():
     proxies = []
@@ -972,9 +690,7 @@ def _load_proxies():
                 if p: proxies.append(p)
     return proxies
 
-
 _proxy_pool = _load_proxies()
-
 
 def get_random_proxy_url(exclude_url=None, alive_only=True):
     if not PROXY_ENABLED or not _proxy_pool:
@@ -985,7 +701,6 @@ def get_random_proxy_url(exclude_url=None, alive_only=True):
         cands = [p["url"] for p in _proxy_pool if p.get("url") and p["url"] != exclude_url]
     return random.choice(cands) if cands else None
 
-
 def _is_proxy_error(exc):
     msg = str(exc).lower()
     return any(kw in msg for kw in (
@@ -993,7 +708,6 @@ def _is_proxy_error(exc):
         "connection refused", "network unreachable", "no route to host",
         "could not connect to proxy", "unable to connect to proxy",
         "recv failure", "ssl handshake", "timed out"))
-
 
 async def _proxy_health_loop():
     while True:
@@ -1005,23 +719,17 @@ async def _proxy_health_loop():
             alive, dead = await check_proxies_bulk(snapshot)
             log.info(f"[HEALTH] alive={alive} dead={dead}")
             async with _proxy_pool_lock:
-                before = len(_proxy_pool)
                 _proxy_pool[:] = [p for p in _proxy_pool if p.get("fail_count", 0) < PROXY_MAX_FAILS]
                 _persist_proxies()
         except Exception as exc:
             log.error(f"[HEALTH] {exc}")
-
 
 def start_proxy_health_monitor():
     global _proxy_health_task
     if _proxy_health_task is None or _proxy_health_task.done():
         _proxy_health_task = asyncio.create_task(_proxy_health_loop())
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── DORK PARSER (unchanged from v19.0) ──────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── DORK PARSER ─────────────────────────────────────────────────────────────
 KNOWN_OPERATORS = {
     "inurl", "intitle", "intext", "inanchor", "site", "filetype", "ext",
     "cache", "link", "related", "info", "allinurl", "allintitle", "allintext",
@@ -1039,7 +747,6 @@ ENGINE_OPERATOR_ALIAS = {
     "yahoo": {"intext": None, "inanchor": None},
 }
 
-
 class DorkToken:
     __slots__ = ("kind", "op", "value", "negate", "quoted")
     def __init__(self, kind, op, value, negate=False, quoted=False):
@@ -1047,7 +754,6 @@ class DorkToken:
     def __repr__(self):
         n = "-" if self.negate else ""; q = '"' if self.quoted else ""
         return f"{n}{self.op}:{q}{self.value}{q}" if self.op else f"{n}{q}{self.value}{q}"
-
 
 class DorkAST:
     def __init__(self, tokens, raw):
@@ -1063,12 +769,10 @@ class DorkAST:
         return [t.value for t in self.tokens if not t.op and t.kind in ("term", "phrase")]
     def __repr__(self): return " ".join(repr(t) for t in self.tokens)
 
-
 _DORK_TOKEN_RE = re.compile(
     r"""(?P<neg>-)?(?:(?P<op>[a-zA-Z]+):)?(?:"(?P<phrase>[^"]+)"|\((?P<group>[^)]+)\)|(?P<term>[^\s"()]+))""",
     re.VERBOSE,
 )
-
 
 def parse_dork(dork):
     tokens = []
@@ -1085,7 +789,6 @@ def parse_dork(dork):
                 tokens.append(DorkToken("term", op, term, negate=neg))
     return DorkAST(tokens, dork.strip())
 
-
 def validate_dork(dork):
     if not dork or not dork.strip(): return False, "Empty dork"
     if dork.count('"') % 2 != 0: return False, "Unbalanced double-quotes"
@@ -1098,7 +801,6 @@ def validate_dork(dork):
         return False, "No search terms"
     return True, "OK"
 
-
 def normalize_dork(dork):
     ast = parse_dork(dork); seen=set(); out=[]
     for t in ast.tokens:
@@ -1106,7 +808,6 @@ def normalize_dork(dork):
         if key in seen: continue
         seen.add(key); out.append(repr(t))
     return " ".join(out)
-
 
 def translate_dork(dork, engine):
     if engine not in ENGINE_OPERATOR_SUPPORT: return dork
@@ -1131,7 +832,6 @@ def translate_dork(dork, engine):
             out.append(repr(t))
     return " ".join(out)
 
-
 def mutate_dork(dork, n=5):
     variations = {dork}
     ast = parse_dork(dork); ops = ast.operators
@@ -1155,7 +855,6 @@ def mutate_dork(dork, n=5):
     random.shuffle(out)
     return ([dork] + out)[:max(1, n)]
 
-
 def dedupe_dorks(dorks):
     seen=set(); out=[]
     for d in dorks:
@@ -1164,11 +863,7 @@ def dedupe_dorks(dorks):
         seen.add(norm); out.append(d.strip())
     return out
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── URL FILTER / SCORER (unchanged) ─────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── URL FILTER / SCORER ─────────────────────────────────────────────────────
 BLACKLISTED_DOMAINS = {
     "yahoo.uservoice.com", "uservoice.com", "bing.com", "google.com", "googleapis.com",
     "gstatic.com", "youtube.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
@@ -1202,7 +897,6 @@ _JUNK_RE = re.compile(
     r"/fonts/|/media/|/cdn-cgi/|/wp-content/uploads/", re.IGNORECASE,
 )
 
-
 def score_url(url):
     try: parsed = urlparse(url)
     except Exception: return 0
@@ -1228,16 +922,7 @@ def score_url(url):
     if len(params) > 8: score -= 5
     return max(0, min(score, 100))
 
-
-def filter_scored(urls, min_score):
-    result = [(score_url(u), u) for u in urls]
-    result = [(s, u) for s, u in result if s >= min_score]
-    result.sort(reverse=True)
-    return result
-
-
 MAX_URL_LENGTH = 200
-
 
 def extract_domain(url):
     try:
@@ -1245,23 +930,19 @@ def extract_domain(url):
         return netloc[4:] if netloc.startswith("www.") else netloc
     except Exception: return ""
 
-
 def is_blocked(domain):
     for bd in BLACKLISTED_DOMAINS:
         if bd in domain: return True
     return False
 
-
 def has_query_params(url):
     try: return bool(urlparse(url).query)
     except Exception: return False
-
 
 def is_valid_url(url):
     try:
         p = urlparse(url); return p.scheme in ("http","https") and bool(p.netloc)
     except Exception: return False
-
 
 def filter_urls(urls):
     total = len(urls); rm_invalid=rm_blocked=rm_no_query=rm_too_long=0
@@ -1280,21 +961,17 @@ def filter_urls(urls):
             "rm_no_query":rm_no_query,"rm_too_long":rm_too_long,
             "duplicates": total-rm_invalid-rm_blocked-rm_no_query-rm_too_long-len(kept)}
 
-
 _TRACKING_PARAM_RE = re.compile(
     r"^(utm_\w+|fbclid|gclid|msclkid|yclid|mc_\w+|_ga|ref|source|medium|campaign|"
     r"affiliate|clickid|cid|sid_?|zanpid|dclid|twclid|igshid|s_kwcid)$",
     re.IGNORECASE,
 )
 
-
 def _normalize_url_for_dedup(url: str) -> str:
-    """Strip common tracking/noise params so near-duplicate URLs collapse."""
     try:
         p = urlparse(url)
         if not p.query:
             return url
-        from urllib.parse import urlencode
         params = parse_qs(p.query, keep_blank_values=True)
         cleaned = {k: v for k, v in params.items() if not _TRACKING_PARAM_RE.match(k)}
         if cleaned == params:
@@ -1304,75 +981,8 @@ def _normalize_url_for_dedup(url: str) -> str:
     except Exception:
         return url
 
-
-async def process_chunk_urls(chunk, semaphore, stop_ev):
-    async with semaphore:
-        if stop_ev.is_set(): return []
-        await asyncio.sleep(0)
-        return filter_urls(chunk)["kept"]
-
-
-async def run_url_clean_job(chat_id, raw_lines, context):
-    CLEAN_CHUNK_SIZE = 500; MAX_CONCURRENT = 4
-    stop_ev = asyncio.Event()
-    active_stop_evs[chat_id] = stop_ev
-    total_input = len(raw_lines)
-    status_msg = await context.bot.send_message(
-        chat_id,
-        f"🧹 URL CLEANER STARTED\n{'━'*30}\n📥 Input: {total_input}\n⏳ Processing...",
-    )
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    chunks = [raw_lines[i:i+CLEAN_CHUNK_SIZE] for i in range(0, total_input, CLEAN_CHUNK_SIZE)]
-    tasks = [asyncio.create_task(process_chunk_urls(c, semaphore, stop_ev)) for c in chunks]
-    try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        stop_ev.set()
-        for t in tasks: t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        results = []
-    seen_final=set(); final_urls=[]
-    for r in results:
-        if isinstance(r, list):
-            for u in r:
-                if u not in seen_final:
-                    seen_final.add(u); final_urls.append(u)
-    full_stats = filter_urls(raw_lines)
-    removed = total_input - len(final_urls)
-    stopped = stop_ev.is_set()
-    output_path = Path("results") / "cleaned_urls.txt"
-    output_path.parent.mkdir(exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"# URL Cleaner — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"# Input: {total_input} | Kept: {len(final_urls)} | Removed: {removed}\n\n")
-        for u in final_urls: f.write(u + "\n")
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=status_msg.message_id,
-            text=(f"{'⏹' if stopped else '✅'} URL CLEANER DONE\n{'━'*30}\n"
-                  f"📥 Input  : {total_input}\n✅ Kept   : {len(final_urls)}\n"
-                  f"🗑 Removed: {removed}\n{'━'*30}"),
-        )
-    except Exception: pass
-    if final_urls:
-        with open(output_path, "rb") as f:
-            await context.bot.send_document(chat_id, f, filename="cleaned_urls.txt",
-                caption=f"🧹 {len(final_urls)} kept from {total_input}")
-    else:
-        await context.bot.send_message(chat_id, "⚠️ No URLs passed the filters.")
-    active_stop_evs.pop(chat_id, None)
-    active_jobs.pop(chat_id, None)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── SESSION FACTORY v20.0 — ROTATING TLS + SESSION POOL ─────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _make_isolated_session(use_tor=False, proxy=None, profile=None, http2=True):
-    """
-    Build a session with a rotated TLS fingerprint.
-    `profile` lets caller pin a specific TLS profile; otherwise random.
-    """
+# ─── SESSION FACTORY ─────────────────────────────────────────────────────────
+def _make_isolated_session(use_tor=False, proxy=None, profile=None):
     chosen_proxy = None
     if use_tor:
         chosen_proxy = TOR_PROXY
@@ -1388,7 +998,7 @@ def _make_isolated_session(use_tor=False, proxy=None, profile=None, http2=True):
         "impersonate": profile["impersonate"],
         "verify":      False,
         "timeout":     20,
-        "default_headers": False,   # we control headers ourselves
+        "default_headers": False,
     }
     if chosen_proxy:
         kwargs["proxy"] = chosen_proxy
@@ -1397,53 +1007,91 @@ def _make_isolated_session(use_tor=False, proxy=None, profile=None, http2=True):
     sess._tls_profile = profile
     return sess
 
-
 def _make_fallback_session(exclude_proxy=None):
     fb_proxy = get_random_proxy_url(exclude_url=exclude_proxy)
     return _make_isolated_session(proxy=fb_proxy)
 
-
-# ─── XTREAM SESSION POOL ─────────────────────────────────────────────────────
-# Pre-warmed pool of sessions for 1000 RPS Yahoo bruteforce
+_YAHOO_CATEGORIES = [
+    "https://news.yahoo.com/",
+    "https://finance.yahoo.com/",
+    "https://sports.yahoo.com/",
+    "https://www.yahoo.com/entertainment/",
+]
+_WARM_QUERIES = ["weather", "news today", "sports", "movies", "travel deals", "recipes"]
 
 async def _preseed_session_cookies(sess, engine: str = "yahoo") -> None:
-    """
-    Visit a search engine homepage before querying.
-    This warms the cookie jar and makes the session look like a real browser
-    that browsed naturally rather than hitting the API cold.
-    """
     try:
-        if engine == "bing":
-            url = random.choice(BING_HOMEPAGES)
-        else:
-            url = random.choice(YAHOO_HOMEPAGES)
         profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers = build_headers_from_profile(profile)
-        await sess.get(url, headers=headers, timeout=10)
-        await asyncio.sleep(random.uniform(0.15, 0.4))
+
+        if engine == "bing":
+            home = random.choice(BING_HOMEPAGES)
+            h1   = build_headers_from_profile(profile)
+            try:
+                await sess.get(home, headers=h1, timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.25, 0.65))
+            h2 = build_headers_from_profile(profile, referer=home)
+            try:
+                await sess.get(
+                    "https://www.bing.com/search",
+                    params={"q": random.choice(_WARM_QUERIES), "form": "QBLH", "setlang": "en"},
+                    headers=h2, timeout=9,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.15, 0.35))
+            return
+
+        home = random.choice(YAHOO_HOMEPAGES)
+        h1   = build_headers_from_profile(profile)
+
+        try:
+            await sess.get(home, headers=h1, timeout=10)
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        if random.random() < 0.60:
+            h2 = build_headers_from_profile(profile, referer=home)
+            try:
+                await sess.get(random.choice(_YAHOO_CATEGORIES), headers=h2, timeout=9)
+            except Exception:
+                pass
+            await asyncio.sleep(random.uniform(0.15, 0.40))
+            ref_for_search = random.choice(_YAHOO_CATEGORIES)
+        else:
+            ref_for_search = home
+
+        endpoint = random.choice(YAHOO_ENDPOINTS)
+        h3 = build_headers_from_profile(profile, referer=ref_for_search)
+        try:
+            await sess.get(
+                endpoint,
+                params={"p":  random.choice(_WARM_QUERIES), "fr": random.choice(_YAHOO_FR_POOL_ADV), "ei": "UTF-8"},
+                headers=h3, timeout=9,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.10, 0.30))
     except Exception:
         pass
 
-
 class XtreamSessionPool:
-    """
-    Maintains a rotating pool of pre-built sessions for maximum throughput.
-    Each session keeps cookies & a stable TLS profile to look human.
-    Sessions are rotated based on usage count + age.
-    Pool is initialized in parallel batches for fast startup.
-    """
     def __init__(self, size=XTREAM_SESSION_POOL_SIZE, engine: str = "yahoo"):
-        self.size   = size
-        self.engine = engine  # which engine to pre-seed cookies for
-        self.sessions: deque = deque()
-        self._usage: dict = {}    # session_id -> count
-        self._age:   dict = {}    # session_id -> ts
-        self._lock   = asyncio.Lock()
-        self._closed = False
+        self.size         = size
+        self.engine       = engine
+        self.sessions:    deque = deque()
+        self._usage:      dict  = {}
+        self._age:        dict  = {}
+        self._lock                = asyncio.Lock()
+        self._closed              = False
+        self._use_tor             = False
+        self._replenish_sem       = None
 
-    async def _make_one(self, use_tor: bool) -> None:
+    async def _make_one(self) -> None:
         profile = get_tls_profile("weighted")
-        sess = _make_isolated_session(use_tor=use_tor, profile=profile)
+        sess    = _make_isolated_session(use_tor=self._use_tor, profile=profile)
         if XTREAM_PRESEED_COOKIES:
             seed_engine = "bing" if self.engine == "bing" else "yahoo"
             await _preseed_session_cookies(sess, engine=seed_engine)
@@ -1453,89 +1101,77 @@ class XtreamSessionPool:
             self._usage[sid] = 0
             self._age[sid]   = time.time()
 
-    async def initialize(self, use_tor=False):
+    async def initialize(self, use_tor: bool = False) -> None:
+        self._use_tor       = use_tor
+        self._replenish_sem = asyncio.Semaphore(XTREAM_POOL_BATCH_SIZE)
         log.info(f"[XTREAM] Building session pool of {self.size} (batch={XTREAM_POOL_BATCH_SIZE})...")
         tasks_left = self.size
         while tasks_left > 0:
             batch = min(XTREAM_POOL_BATCH_SIZE, tasks_left)
-            await asyncio.gather(*[self._make_one(use_tor) for _ in range(batch)],
-                                  return_exceptions=True)
+            await asyncio.gather(*[self._make_one() for _ in range(batch)], return_exceptions=True)
             tasks_left -= batch
         log.info(f"[XTREAM] Pool ready: {len(self.sessions)} sessions")
 
     async def acquire(self):
-        """Get a session from the pool (rotates round-robin)."""
         async with self._lock:
             if not self.sessions:
                 profile = get_tls_profile("weighted")
-                sess = _make_isolated_session(profile=profile)
-                self._usage[id(sess)] = 0
-                self._age[id(sess)]   = time.time()
+                sess    = _make_isolated_session(use_tor=self._use_tor, profile=profile)
+                sid     = id(sess)
+                self._usage[sid] = 0
+                self._age[sid]   = time.time()
                 return sess
-            sess = self.sessions.popleft()
-            return sess
+            return self.sessions.popleft()
 
-    async def release(self, sess, burned=False):
-        """Return session to pool. If burned (got blocked), replace it."""
+    async def release(self, sess, burned: bool = False) -> None:
         if self._closed:
             try: await sess.close()
             except Exception: pass
             return
         async with self._lock:
-            sid = id(sess)
+            sid      = id(sess)
             self._usage[sid] = self._usage.get(sid, 0) + 1
-            too_old   = (time.time() - self._age.get(sid, 0)) > XTREAM_SESSION_MAX_AGE
-            too_used  = self._usage[sid] > XTREAM_SESSION_MAX_USES
+            too_old  = (time.time() - self._age.get(sid, 0)) > XTREAM_SESSION_MAX_AGE
+            too_used = self._usage[sid] > XTREAM_SESSION_MAX_USES
             if burned or too_old or too_used:
                 try: await sess.close()
                 except Exception: pass
-                self._usage.pop(sid, None); self._age.pop(sid, None)
-                profile   = get_tls_profile("weighted")
-                new_sess  = _make_isolated_session(profile=profile)
-                self._usage[id(new_sess)] = 0
-                self._age[id(new_sess)]   = time.time()
-                self.sessions.append(new_sess)
+                self._usage.pop(sid, None)
+                self._age.pop(sid, None)
+                sem = self._replenish_sem
+                if sem is not None:
+                    async def _replenish(_sem=sem):
+                        async with _sem:
+                            await self._make_one()
+                    asyncio.create_task(_replenish())
+                else:
+                    asyncio.create_task(self._make_one())
             else:
                 self.sessions.append(sess)
 
-    async def close_all(self):
+    async def close_all(self) -> None:
         self._closed = True
         async with self._lock:
             while self.sessions:
                 s = self.sessions.popleft()
                 try: await s.close()
                 except Exception: pass
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── NORMAL MODE YAHOO SESSION POOL — Advanced TLS Rotation ──────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Gives normal-bulk-mode Yahoo workers the same benefits as XTREAM:
-#   • One pre-seeded session per worker (distinct TLS fingerprint each)
-#   • Sessions rotate automatically after MAX_USES requests or MAX_AGE seconds
-#   • On captcha / 429 / 403: session is burned; pool spawns a replacement
-#     asynchronously with a new TLS profile (no blocking other workers)
-#   • Pool is initialised in parallel at chunk-start before any dork fires
-# ══════════════════════════════════════════════════════════════════════════════
+            self._usage.clear()
+            self._age.clear()
 
 class NormalYahooSessionPool:
-    """
-    Lightweight rotating session pool for Yahoo in normal bulk mode.
-    API is intentionally identical to XtreamSessionPool so workers can
-    call acquire() / release(burned=…) without knowing which pool type
-    they hold.
-    """
-    _MAX_USES = 25       # rotate session after this many requests
-    _MAX_AGE  = 300.0    # rotate session after 5 minutes regardless of use
+    _MAX_USES             = 15
+    _MAX_AGE              = 300.0
+    _MAX_CONCURRENT_REPLENISH = 4
 
     def __init__(self, size: int = 4):
-        self.size     = size
+        self.size       = size
         self._sessions: deque = deque()
         self._usage:   dict   = {}
         self._age:     dict   = {}
-        self._lock             = asyncio.Lock()
-        self._closed           = False
+        self._lock              = asyncio.Lock()
+        self._closed            = False
+        self._replenish_sem     = None
 
     async def _make_one(self) -> None:
         profile = get_tls_profile("weighted")
@@ -1548,19 +1184,16 @@ class NormalYahooSessionPool:
             self._age[sid]   = time.time()
 
     async def initialize(self) -> None:
-        """Pre-warm the pool in parallel before the job starts."""
-        batch = min(self.size, 8)
+        self._replenish_sem = asyncio.Semaphore(self._MAX_CONCURRENT_REPLENISH)
+        batch     = min(self.size, 8)
         remaining = self.size
         while remaining > 0:
             n = min(batch, remaining)
-            await asyncio.gather(*[self._make_one() for _ in range(n)],
-                                  return_exceptions=True)
+            await asyncio.gather(*[self._make_one() for _ in range(n)], return_exceptions=True)
             remaining -= n
-        log.info(f"[YAHOO-ADV] Pool ready: {len(self._sessions)} sessions "
-                 f"({self.size} requested)")
+        log.info(f"[YAHOO-ADV] Pool ready: {len(self._sessions)} sessions ({self.size} requested)")
 
     async def acquire(self):
-        """Return a session from the pool (or create one on-demand)."""
         async with self._lock:
             if not self._sessions:
                 profile = get_tls_profile("weighted")
@@ -1572,7 +1205,6 @@ class NormalYahooSessionPool:
             return self._sessions.popleft()
 
     async def release(self, sess, burned: bool = False) -> None:
-        """Return session to pool; replace if burned, too-old, or over-used."""
         if self._closed:
             try: await sess.close()
             except Exception: pass
@@ -1587,8 +1219,14 @@ class NormalYahooSessionPool:
                 except Exception: pass
                 self._usage.pop(sid, None)
                 self._age.pop(sid, None)
-                # Replenish asynchronously — doesn't block the caller
-                asyncio.create_task(self._make_one())
+                sem = self._replenish_sem
+                if sem is not None:
+                    async def _replenish(_sem=sem):
+                        async with _sem:
+                            await self._make_one()
+                    asyncio.create_task(_replenish())
+                else:
+                    asyncio.create_task(self._make_one())
             else:
                 self._sessions.append(sess)
 
@@ -1599,9 +1237,10 @@ class NormalYahooSessionPool:
                 s = self._sessions.popleft()
                 try: await s.close()
                 except Exception: pass
+            self._usage.clear()
+            self._age.clear()
 
-
-# ─── TOR ROTATION (unchanged) ────────────────────────────────────────────────
+# ─── TOR ROTATION ────────────────────────────────────────────────────────────
 _tor_rotation_task = None
 tor_enabled_users = 0
 
@@ -1634,23 +1273,34 @@ def stop_tor_rotation():
         _tor_rotation_task.cancel()
         _tor_rotation_task = None
 
-
 # ─── CAPTCHA / DEGRADED DETECTION ────────────────────────────────────────────
 _CAPTCHA_RE = re.compile(
     r"captcha|are you a robot|unusual traffic|access denied|verify you are human|"
     r"please verify|too many requests|blocked|forbidden|rate limit|temporarily unavailable|"
     r"cf-error|error 429|request denied|robot check|human verification|"
     r"your ip|ip address|automated|bot detection|security check|"
-    r"503 service|502 bad gateway|pardon our interruption",
+    r"503 service|502 bad gateway|pardon our interruption|"
+    r"yahoo.*captcha|challenge.*yahoo|yahoo.*challenge|captcha\.yahoo|"
+    r"suspicious activity|validate your request|confirm you.re human|"
+    r"sign in to continue|please sign in to|account verification required|"
+    r"we.ve detected unusual|traffic from your network|automated queries|"
+    r"not a robot|recaptcha|hcaptcha|cf_chl_captcha|jschl_vc|"
+    r"challenge-running|_cf_chl|cf-ray|cf_clearance|"
+    r"div#captcha-container|form\[action.*yahooapis\]|"
+    r"div\.captcha|#captcha|\.challenge-form|challenge-error-title",
     re.IGNORECASE,
 )
 
 _YAHOO_RESULT_SIGNALS = re.compile(
     r'id="results"|searchCenterMiddle|class="algo|class="Sr|data-b="algo|'
-    r'"algo-sr"|"dd algo"|uh3_id|"compTitle"',
+    r'"algo-sr"|"dd algo"|uh3_id|"compTitle"|'
+    r'"searchResult"|class="web-algo"|"organic-result"|'
+    r'"PartnerSearchResult"|"searchCenterCol"|'
+    r'"sres-cnt"|"voh-serp-main"|"algo-section"|'
+    r'"compDocs"|"algo-list"|"td-applet-webresults"|'
+    r'data-wf-type="SerpMiddle"|"sys-hdr"|"reg searchstring"',
     re.IGNORECASE,
 )
-
 
 def _is_degraded(html, engine):
     if len(html) < 400: return True
@@ -1660,17 +1310,17 @@ def _is_degraded(html, engine):
     if engine == "duckduckgo" and "result__a" not in html and "results--main" not in html: return True
     return False
 
-
 def _is_captcha(html):
     return bool(_CAPTCHA_RE.search(html[:4096]))
 
+async def _on_captcha_detected(engine: str, chunk_id: int, session_proxy) -> None:
+    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA — entering bypass cooldown")
+    if engine == "yahoo":
+        await asyncio.sleep(random.uniform(10.0, 20.0))
+    else:
+        await asyncio.sleep(random.uniform(15.0, 30.0))
 
-async def _on_captcha_detected(engine, chunk_id, session_proxy):
-    log.warning(f"[C{chunk_id}][{engine.upper()}] 🔴 CAPTCHA")
-    await asyncio.sleep(random.uniform(8.0, 18.0))
-
-
-# ─── LINK EXTRACTION (unchanged) ─────────────────────────────────────────────
+# ─── LINK EXTRACTION ─────────────────────────────────────────────────────────
 class _LinkExtractor(HTMLParser):
     __slots__ = ("links", "_in_cite", "_buf")
     def __init__(self):
@@ -1692,23 +1342,19 @@ class _LinkExtractor(HTMLParser):
     def handle_data(self, data):
         if self._in_cite: self._buf.append(data)
 
-
 def _extract_links(html):
     p = _LinkExtractor()
     try: p.feed(html)
     except Exception: pass
     return p.links
 
-
 _DDG_LINK_RE    = re.compile(r'class="result__a"[^>]*href="(https?://[^"]+)"', re.IGNORECASE)
 _DDG_SNIPPET_RE = re.compile(r'uddg=(https?[^&"]+)', re.IGNORECASE)
-
 
 def _extract_ddg_links(html):
     links = [unquote(m.group(1)) for m in _DDG_LINK_RE.finditer(html)]
     links += [unquote(m.group(1)) for m in _DDG_SNIPPET_RE.finditer(html)]
     return links
-
 
 _BING_NOISE    = re.compile(r"bing\.com", re.IGNORECASE)
 _YAHOO_NOISE   = re.compile(r"yimg\.com|yahoo\.com|doubleclick\.net|googleadservices", re.IGNORECASE)
@@ -1716,40 +1362,10 @@ _STATIC_EXT    = re.compile(r"\.(css|js|png|jpg|jpeg|gif|svg|ico|webp|woff2?|ttf
 _YAHOO_RU_PATH = re.compile(r"/RU=([^/&]+)")
 _DDG_NOISE     = re.compile(r"duckduckgo\.com|duck\.com", re.IGNORECASE)
 
-
-def _yahoo_link_extractor(html):
-    raw = _extract_links(html)
-    out = []
-    for u in raw:
-        if "r.search.yahoo.com" in u or "/r/" in u:
-            parsed = urlparse(u)
-            qs = parse_qs(parsed.query)
-            if "RU" in qs:
-                real = unquote(qs["RU"][0])
-                if real.startswith(("http://", "https://")): u = real
-            else:
-                m = _YAHOO_RU_PATH.search(parsed.path)
-                if m:
-                    real = unquote(m.group(1))
-                    if real.startswith(("http://", "https://")): u = real
-        out.append(u)
-    return out
-
-
 _YAHOO_RU_PATH_V2     = re.compile(r"/RU=([^/&]+)")
-_YAHOO_REDIRECT_HOSTS = frozenset(["r.search.yahoo.com", "rd.yahoo.com",
-                                    "search.yahoo.com"])
-
+_YAHOO_REDIRECT_HOSTS = frozenset(["r.search.yahoo.com", "rd.yahoo.com", "search.yahoo.com"])
 
 def _yahoo_link_extractor_v2(html: str) -> list:
-    """
-    Enhanced Yahoo link extractor for advanced mode.
-    Handles all known Yahoo redirect patterns:
-      • r.search.yahoo.com/RU=<encoded>
-      • rd.yahoo.com redirect paths
-      • /r/ short-redirect paths
-      • Query-string RU= on any yahoo domain
-    """
     raw = _extract_links(html)
     out = []
     for u in raw:
@@ -1782,9 +1398,7 @@ def _yahoo_link_extractor_v2(html: str) -> list:
         out.append(u)
     return out
 
-
-# ─── FAST FETCH (v20.0) — uses TLS rotation + better retry ──────────────────
-
+# ─── FAST FETCH ──────────────────────────────────────────────────────────────
 async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
                                   engine, page, max_res, chunk_id, referer,
                                   link_extractor, noise_filter, max_retries=None):
@@ -1794,23 +1408,19 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
     fallback_session = None
     try:
         for attempt in range(max_retries):
-            # ── Circuit breaker: pause if the domain is currently OPEN ──────
             wait_secs = await circuit_breaker.check(url)
             if wait_secs > 0:
                 await asyncio.sleep(min(wait_secs, 30.0))
 
-            # Build headers from the session's TLS profile for consistency
             profile = getattr(active_session, "_tls_profile", None) or get_tls_profile()
             origin = referer.rstrip("/") if data is not None else None
             headers = build_headers_from_profile(profile, referer=referer, origin=origin)
-            # Optional XFF header noise (~35% of requests)
             spoof_xff_headers(headers, probability=0.35)
             if data is not None:
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
             try:
                 if method == "GET":
-                    resp = await active_session.get(url, params=params, headers=headers,
-                                                     timeout=20)
+                    resp = await active_session.get(url, params=params, headers=headers, timeout=20)
                 else:
                     resp = await active_session.post(url, data=data, headers=headers, timeout=20)
                 status = resp.status_code; html = resp.text
@@ -1863,7 +1473,6 @@ async def _generic_engine_fetch(session, method, url, *, params=None, data=None,
         if fallback_session is not None:
             await fallback_session.close()
 
-
 async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
     base_params = {"q": translate_dork(dork, "bing"), "count": min(max_res, 10),
                    "first": (page-1)*10+1, "setlang": "en"}
@@ -1876,52 +1485,35 @@ async def fetch_page_bing(session, dork, page, max_res, chunk_id=0):
         noise_filter=lambda u: bool(_BING_NOISE.search(u)),
     )
 
-
 async def fetch_page_yahoo(session, dork, page, max_res, chunk_id=0):
-    base_params = {"p": translate_dork(dork, "yahoo"), "b": (page-1)*10+1,
-                   "pz": min(max_res, 10), "vl": "lang_en"}
+    endpoint = random.choice(YAHOO_ENDPOINTS)
+    ep_host  = urlparse(endpoint).netloc
+    referer  = f"https://{ep_host}/"
+    base_params = {
+        "p":  translate_dork(dork, "yahoo"),
+        "b":  (page - 1) * 10 + 1,
+        "pz": min(max_res, 10),
+        "vl": "lang_en",
+    }
     return await _generic_engine_fetch(
-        session, "GET", "https://search.yahoo.com/search",
-        params=vary_yahoo_params(base_params),
+        session, "GET", endpoint,
+        params=vary_yahoo_params_advanced(base_params),
         engine="yahoo", page=page, max_res=max_res, chunk_id=chunk_id,
-        referer="https://search.yahoo.com/",
-        link_extractor=_yahoo_link_extractor,
+        referer=referer,
+        link_extractor=_yahoo_link_extractor_v2,
         noise_filter=lambda u: bool(_YAHOO_NOISE.search(u)),
     )
 
-
-# ─── YAHOO ADVANCED FETCH — Normal Bulk Mode ──────────────────────────────────
-# Per-request TLS rotation via NormalYahooSessionPool + 15-mirror endpoint
-# rotation. On any block (429/403/captcha/degraded) the current session is
-# burned and a fresh one with a new TLS fingerprint is acquired from the pool.
-# Referers are matched to the chosen endpoint domain so cross-origin signals
-# are avoided. Enhanced parameter variance masks templated patterns.
-# ─────────────────────────────────────────────────────────────────────────────
-
 _YAHOO_ADV_MAX_RETRIES = 4
-
 
 async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
                                      dork: str, page: int,
                                      max_res: int, chunk_id: int = 0) -> tuple:
-    """
-    Advanced Yahoo fetch for normal bulk mode.
-    Returns (urls: list, degraded: bool) — same signature as fetch_page_yahoo.
-
-    Strategy:
-     • 15 Yahoo regional mirrors rotated per attempt
-     • Endpoint-matched referer (avoids cross-origin flag)
-     • Fresh TLS fingerprint swap on every block event
-     • Cookie-preseeded sessions via NormalYahooSessionPool
-     • Enhanced parameter variance on every request
-     • Circuit-breaker aware (respects per-domain back-off)
-    """
     sess   = await pool.acquire()
     burned = False
     try:
         for attempt in range(_YAHOO_ADV_MAX_RETRIES):
             endpoint = random.choice(YAHOO_ENDPOINTS)
-            # Match referer to endpoint domain — prevents cross-origin signals
             ep_host  = urlparse(endpoint).netloc
             referer  = f"https://{ep_host}/"
             profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
@@ -1935,22 +1527,19 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
                 "vl": "lang_en",
             })
 
-            # Respect circuit-breaker cooldown for this endpoint
             wait_secs = await circuit_breaker.check(endpoint)
             if wait_secs > 0:
                 await asyncio.sleep(min(wait_secs, 30.0))
 
             try:
-                resp   = await sess.get(endpoint, params=params,
-                                        headers=headers, timeout=22)
+                resp   = await sess.get(endpoint, params=params, headers=headers, timeout=22)
                 status = resp.status_code
                 html   = resp.text
 
                 if status in (429, 403, 503):
                     await circuit_breaker.record(endpoint, blocked=True)
-                    # Burn session → fresh TLS fingerprint for next attempt
                     await pool.release(sess, burned=True)
-                    burned = False   # pool has taken ownership; final block won't re-release
+                    burned = False
                     sess   = await pool.acquire()
                     await asyncio.sleep(humanize_delay(3.5 * (attempt + 1)))
                     continue
@@ -1974,7 +1563,6 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
                         continue
                     return [], True
 
-                # Success — extract and clean URLs
                 urls = _yahoo_link_extractor_v2(html)
                 urls = [u for u in urls if u.startswith("http")
                         and not _YAHOO_NOISE.search(u)
@@ -2000,18 +1588,11 @@ async def fetch_page_yahoo_advanced(pool: "NormalYahooSessionPool",
 
         return [], True
     finally:
-        # Only release if we still own the session (not already burned+swapped)
         await pool.release(sess, burned=burned)
-
 
 async def fetch_all_pages_yahoo_adv(pool: "NormalYahooSessionPool",
                                      dork: str, pages: list,
                                      max_res: int, chunk_id: int = 0) -> tuple:
-    """
-    Multi-page Yahoo fetch using the advanced pool.
-    Each page request independently acquires/releases a session so
-    concurrent pages get different TLS fingerprints.
-    """
     sorted_pages = sorted(pages)
 
     async def _fetch_one(page, idx):
@@ -2029,7 +1610,6 @@ async def fetch_all_pages_yahoo_adv(pool: "NormalYahooSessionPool",
         all_urls.extend(urls)
     return all_urls, degraded_total
 
-
 async def fetch_page_duckduckgo(session, dork, page, max_res, chunk_id=0):
     if page > 1: return [], False
     return await _generic_engine_fetch(
@@ -2041,7 +1621,6 @@ async def fetch_page_duckduckgo(session, dork, page, max_res, chunk_id=0):
         noise_filter=lambda u: bool(_DDG_NOISE.search(u)),
     )
 
-
 async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
     sorted_pages = [min(pages)] if engine == "duckduckgo" else sorted(pages)
     fetch_fn = {"bing":fetch_page_bing, "yahoo":fetch_page_yahoo,
@@ -2049,7 +1628,6 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
 
     async def _fetch_with_stagger(page, idx):
         if idx > 0:
-            # Gaussian jitter instead of uniform — more human-like inter-page timing
             await asyncio.sleep(humanize_delay(0.05 * idx, sigma_ratio=0.4))
         return await fetch_fn(session, dork, page, max_res, chunk_id)
 
@@ -2063,184 +1641,208 @@ async def fetch_all_pages(session, dork, engine, pages, max_res, chunk_id=0):
         all_urls.extend(urls)
     return all_urls, degraded_total
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── XTREAM MODE — YAHOO BRUTEFORCE @ 1000 URLs/sec ──────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Strategy:
-#  1. Pre-warmed session pool with rotated TLS profiles
-#  2. Yahoo-only (most permissive, weakest captcha enforcement on /search)
-#  3. Per-session cookie/state preservation reduces 403s
-#  4. Async semaphore = WORKERS × CHUNKS = 400 concurrent requests
-#  5. Stagger micro-bursts: 100 requests every 100ms → 1000 RPS
-#  6. Adaptive backoff: any 429/captcha → burn session + cooldown that worker
-#  7. Per-IP rate limiting via proxy rotation
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Yahoo regional endpoints — spread load across mirrors
+# ─── XTREAM MODE ─────────────────────────────────────────────────────────────
 YAHOO_ENDPOINTS = [
-    "https://search.yahoo.com/search",
-    "https://uk.search.yahoo.com/search",
-    "https://ca.search.yahoo.com/search",
-    "https://au.search.yahoo.com/search",
-    "https://in.search.yahoo.com/search",
-    "https://sg.search.yahoo.com/search",
-    "https://de.search.yahoo.com/search",
-    "https://fr.search.yahoo.com/search",
-    "https://es.search.yahoo.com/search",
-    "https://br.search.yahoo.com/search",
-    "https://it.search.yahoo.com/search",
-    "https://nl.search.yahoo.com/search",
-    "https://mx.search.yahoo.com/search",
-    "https://nz.search.yahoo.com/search",
+    "https://search.yahoo.com/search", "https://uk.search.yahoo.com/search",
+    "https://ca.search.yahoo.com/search", "https://au.search.yahoo.com/search",
+    "https://in.search.yahoo.com/search", "https://sg.search.yahoo.com/search",
+    "https://de.search.yahoo.com/search", "https://fr.search.yahoo.com/search",
+    "https://es.search.yahoo.com/search", "https://br.search.yahoo.com/search",
+    "https://it.search.yahoo.com/search", "https://nl.search.yahoo.com/search",
+    "https://mx.search.yahoo.com/search", "https://nz.search.yahoo.com/search",
     "https://za.search.yahoo.com/search",
 ]
 
-YAHOO_REFERERS = [
-    "https://search.yahoo.com/",
-    "https://www.yahoo.com/",
-    "https://uk.search.yahoo.com/",
-    "https://ca.search.yahoo.com/",
-    "https://au.search.yahoo.com/",
-    "https://in.search.yahoo.com/",
-    "https://sg.search.yahoo.com/",
-    "https://de.search.yahoo.com/",
-    "https://fr.search.yahoo.com/",
-]
-
 YAHOO_HOMEPAGES = [
-    "https://www.yahoo.com/",
-    "https://search.yahoo.com/",
-    "https://uk.yahoo.com/",
-    "https://au.yahoo.com/",
-    "https://ca.yahoo.com/",
+    "https://www.yahoo.com/", "https://search.yahoo.com/",
+    "https://uk.yahoo.com/", "https://au.yahoo.com/", "https://ca.yahoo.com/",
 ]
 
-# Bing regional endpoints for XTREAM multi-engine mode
 BING_XTREAM_ENDPOINTS = [
-    "https://www.bing.com/search",
-    "https://cn.bing.com/search",
-    "https://global.bing.com/search",
+    "https://www.bing.com/search", "https://cn.bing.com/search", "https://global.bing.com/search",
 ]
-
-BING_XTREAM_REFERERS = [
-    "https://www.bing.com/",
-    "https://www.bing.com/search",
-    "https://cn.bing.com/",
-]
-
-BING_HOMEPAGES = [
-    "https://www.bing.com/",
-    "https://cn.bing.com/",
-]
-
+BING_XTREAM_REFERERS = ["https://www.bing.com/", "https://www.bing.com/search", "https://cn.bing.com/"]
+BING_HOMEPAGES = ["https://www.bing.com/", "https://cn.bing.com/"]
 BING_XTREAM_MARKETS = ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "en-SG", "en-NZ"]
-
 
 async def xtream_fetch_yahoo(pool: XtreamSessionPool, dork: str, page: int,
                               max_res: int, worker_id: int) -> tuple[list, bool, bool]:
-    """
-    Single Yahoo fetch in xtream mode.
-    Returns (urls, was_burned, was_captcha).
-    """
-    sess = await pool.acquire()
-    burned = False; captcha = False
+    sess       = await pool.acquire()
+    burned     = False
+    captcha    = False
+    noisy_dork = yahoo_captcha_bypass.noise_query(dork)
+
     try:
-        endpoint = random.choice(YAHOO_ENDPOINTS)
-        referer  = random.choice(YAHOO_REFERERS)
-        profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
-            "p": translate_dork(dork, "yahoo"),
-            "b": (page - 1) * 10 + 1,
-            "pz": min(max_res, 10),
-            "vl": "lang_en",
-            "fr": random.choice(["yfp-t", "uh3_search_web", "sfp", "yfp-t-s"]),
-        }
         for attempt in range(XTREAM_MAX_RETRIES + 1):
+            endpoint = yahoo_captcha_bypass.pick_clean_endpoint()
+            ep_host  = urlparse(endpoint).netloc
+            referer  = f"https://{ep_host}/"
+
+            q_remaining = await yahoo_captcha_bypass.is_quarantined(endpoint)
+            if q_remaining > 0:
+                alt = yahoo_captcha_bypass.pick_clean_endpoint(exclude=endpoint)
+                if alt != endpoint:
+                    endpoint = alt
+                    ep_host  = urlparse(endpoint).netloc
+                    referer  = f"https://{ep_host}/"
+
+            profile = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers = build_headers_from_profile(profile, referer=referer)
+            spoof_xff_headers(headers, probability=0.40)
+
+            params = vary_yahoo_params_advanced({
+                "p":  translate_dork(noisy_dork, "yahoo"),
+                "b":  (page - 1) * 10 + 1,
+                "pz": min(max_res, 10),
+                "vl": "lang_en",
+            })
+
+            wait_secs = await circuit_breaker.check(endpoint)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 20.0))
+
             try:
-                resp = await sess.get(endpoint, params=params, headers=headers,
-                                       timeout=XTREAM_TIMEOUT)
-                html = resp.text
-                if resp.status_code == 429:
-                    burned = True
-                    return [], True, False
-                if resp.status_code != 200:
+                resp   = await sess.get(endpoint, params=params, headers=headers, timeout=XTREAM_TIMEOUT)
+                status = resp.status_code
+                html   = resp.text
+
+                if status in (429, 403, 503):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    await yahoo_captcha_bypass.record_captcha(endpoint)
+                    await pool.release(sess, burned=True)
+                    burned  = False
+                    sess    = await pool.acquire()
+                    backoff = random.uniform(2.0, 5.0) * (attempt + 1)
+                    await asyncio.sleep(backoff)
+                    continue
+
+                if status != 200:
+                    await circuit_breaker.record(endpoint, blocked=False)
                     return [], False, False
+
                 if _is_captcha(html):
-                    captcha = True; burned = True
-                    return [], True, True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    q_secs  = await yahoo_captcha_bypass.record_captcha(endpoint)
+                    captcha = True
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    probe_ok  = await yahoo_captcha_bypass.shadow_probe(sess, noisy_dork[:8])
+                    base_wait = max(q_secs * 0.5, random.uniform(6.0, 14.0))
+                    if not probe_ok:
+                        base_wait = min(base_wait * 2.0, 60.0)
+                    await asyncio.sleep(base_wait)
+                    continue
+
                 if _is_degraded(html, "yahoo"):
-                    if attempt < XTREAM_MAX_RETRIES: continue
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    if attempt < XTREAM_MAX_RETRIES:
+                        await asyncio.sleep(random.uniform(0.4, 1.2))
+                        continue
                     return [], False, False
-                urls = _yahoo_link_extractor(html)
-                urls = [u for u in urls if u.startswith("http")
-                        and not _YAHOO_NOISE.search(u) and not _STATIC_EXT.search(u)]
+
+                urls = _yahoo_link_extractor_v2(html)
+                urls = [u for u in urls
+                        if u.startswith("http")
+                        and not _YAHOO_NOISE.search(u)
+                        and not _STATIC_EXT.search(u)]
+                await circuit_breaker.record(endpoint, blocked=False)
+                await yahoo_captcha_bypass.record_success(endpoint)
                 return list(dict.fromkeys(urls))[:max_res], False, False
-            except (asyncio.TimeoutError, CurlError):
-                if attempt < XTREAM_MAX_RETRIES: continue
+
+            except asyncio.TimeoutError:
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(random.uniform(0.3, 1.0) * (attempt + 1))
+                    continue
                 return [], False, False
+
+            except CurlError as exc:
+                if _is_proxy_error(exc) and PROXY_ENABLED and len(_proxy_pool) > 1:
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(humanize_delay(0.8))
+                    continue
+                if attempt < XTREAM_MAX_RETRIES:
+                    await asyncio.sleep(random.uniform(0.2, 0.8))
+                    continue
+                return [], False, False
+
             except Exception as exc:
-                log.debug(f"[XTREAM:W{worker_id}] {exc}")
+                log.debug(f"[XTREAM:W{worker_id}] err: {exc}")
                 return [], False, False
+
         return [], False, False
+
     finally:
         await pool.release(sess, burned=burned)
 
-
 async def xtream_fetch_bing(pool: XtreamSessionPool, dork: str, page: int,
                              max_res: int, worker_id: int) -> tuple[list, bool, bool]:
-    """
-    Single Bing fetch in xtream mode.
-    Returns (urls, was_burned, was_captcha).
-    """
-    sess = await pool.acquire()
-    burned = False; captcha = False
+    sess    = await pool.acquire()
+    burned  = False
+    captcha = False
     try:
-        endpoint = random.choice(BING_XTREAM_ENDPOINTS)
-        referer  = random.choice(BING_XTREAM_REFERERS)
-        profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
-        headers  = build_headers_from_profile(profile, referer=referer)
-        params   = {
-            "q":       translate_dork(dork, "bing"),
-            "count":   min(max_res, 10),
-            "first":   (page - 1) * 10 + 1,
-            "setlang": "en",
-            "mkt":     random.choice(BING_XTREAM_MARKETS),
-            "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
-        }
         for attempt in range(XTREAM_MAX_RETRIES + 1):
+            endpoint = random.choice(BING_XTREAM_ENDPOINTS)
+            referer  = random.choice(BING_XTREAM_REFERERS)
+            profile  = getattr(sess, "_tls_profile", None) or get_tls_profile("weighted")
+            headers  = build_headers_from_profile(profile, referer=referer)
+            params   = {
+                "q":       translate_dork(dork, "bing"),
+                "count":   min(max_res, 10),
+                "first":   (page - 1) * 10 + 1,
+                "setlang": "en",
+                "mkt":     random.choice(BING_XTREAM_MARKETS),
+                "form":    random.choice(["QBLH", "QBRE", "SBSD", "NMSP"]),
+            }
+            wait_secs = await circuit_breaker.check(endpoint)
+            if wait_secs > 0:
+                await asyncio.sleep(min(wait_secs, 20.0))
             try:
-                resp = await sess.get(endpoint, params=params, headers=headers,
-                                      timeout=XTREAM_TIMEOUT)
+                resp = await sess.get(endpoint, params=params, headers=headers, timeout=XTREAM_TIMEOUT)
                 html = resp.text
-                if resp.status_code == 429:
-                    burned = True
-                    return [], True, False
+                if resp.status_code in (429, 403, 503):
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(random.uniform(2.0, 5.0) * (attempt + 1))
+                    continue
                 if resp.status_code not in (200,):
+                    await circuit_breaker.record(endpoint, blocked=False)
                     if attempt < XTREAM_MAX_RETRIES: continue
                     return [], False, False
                 if _is_captcha(html):
-                    captcha = True; burned = True
-                    return [], True, True
+                    await circuit_breaker.record(endpoint, blocked=True)
+                    captcha = True
+                    await pool.release(sess, burned=True)
+                    burned = False
+                    sess   = await pool.acquire()
+                    await asyncio.sleep(random.uniform(6.0, 14.0))
+                    continue
                 if _is_degraded(html, "bing"):
+                    await circuit_breaker.record(endpoint, blocked=True)
                     if attempt < XTREAM_MAX_RETRIES: continue
                     return [], False, False
                 urls = _extract_links(html)
                 urls = [u for u in urls if u.startswith("http")
                         and not _BING_NOISE.search(u) and not _STATIC_EXT.search(u)]
+                await circuit_breaker.record(endpoint, blocked=False)
                 return list(dict.fromkeys(urls))[:max_res], False, False
-            except (asyncio.TimeoutError, CurlError):
+            except asyncio.TimeoutError:
+                await circuit_breaker.record(endpoint, blocked=True)
+                if attempt < XTREAM_MAX_RETRIES: continue
+                return [], False, False
+            except CurlError as exc:
                 if attempt < XTREAM_MAX_RETRIES: continue
                 return [], False, False
             except Exception as exc:
-                log.debug(f"[XTREAM:BING:W{worker_id}] {exc}")
                 return [], False, False
         return [], False, False
     finally:
         await pool.release(sess, burned=burned)
-
 
 async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue,
                           pool: XtreamSessionPool, max_res: int, pages_per_dork: int,
@@ -2248,13 +1850,9 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                           rate_limiter: asyncio.Semaphore,
                           xtream_engine: str,
                           captcha_counter: list):
-    """
-    High-speed XTREAM worker supporting Yahoo, Bing, or both engines.
-    Uses per-worker adaptive cooldown instead of a shared burn event (no race conditions).
-    """
     consecutive_fails = 0
     cooldown_until    = 0.0
-    engine_toggle     = wid % 2  # for "both" mode: even workers → yahoo, odd → bing
+    engine_toggle     = wid % 2
 
     while not stop_ev.is_set():
         try:
@@ -2262,12 +1860,10 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         except asyncio.TimeoutError:
             continue
 
-        # Per-worker cooldown after burns
         now = time.time()
         if cooldown_until > now:
             await asyncio.sleep(cooldown_until - now)
 
-        # Pick engine for this dork
         if xtream_engine == "both":
             use_engine = "yahoo" if engine_toggle % 2 == 0 else "bing"
             engine_toggle += 1
@@ -2277,7 +1873,6 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
         fetch_fn = xtream_fetch_yahoo if use_engine == "yahoo" else xtream_fetch_bing
         tag      = f"{use_engine}-xtream"
 
-        # Crawl multiple pages per dork in parallel (limited by rate_limiter)
         page_tasks = []
         for page in range(1, pages_per_dork + 1):
             async def _do(p=page, fn=fetch_fn):
@@ -2299,12 +1894,35 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
                     if captcha: any_captcha = True
         except asyncio.TimeoutError:
             for t in page_tasks: t.cancel()
+            await asyncio.gather(*page_tasks, return_exceptions=True)
 
-        scored = filter_scored(all_urls, min_score)
+        # Memory optimized pass: Score, Dedup, Tier, Write directly
+        unique_count = 0
+        for url in all_urls:
+            sc = score_url(url)
+            if sc < min_score:
+                continue
+            norm = _normalize_url_for_dedup(url)
+            # Use Bloom filter for ultra-fast dedup
+            if url_bloom.add(f"{dork}:{norm}"):
+                continue
+            
+            unique_count += 1
+            domain_counts[extract_domain(url)] += 1
+            try: incremental_f.write(f"{url}\n")
+            except Exception: pass
+            
+            if sc >= 70:
+                high_urls.append((sc, url))
+            elif sc >= 40 and len(med_urls) < _MED_CAP:
+                med_urls.append((sc, url))
+            elif len(low_urls) < _LOW_CAP:
+                low_urls.append((sc, url))
+
         try:
-            results_q.put_nowait((dork, tag, scored, len(all_urls), any_captcha))
+            results_q.put_nowait((dork, tag, unique_count, len(all_urls), any_captcha))
         except asyncio.QueueFull:
-            await results_q.put((dork, tag, scored, len(all_urls), any_captcha))
+            await results_q.put((dork, tag, unique_count, len(all_urls), any_captcha))
 
         queue.task_done()
 
@@ -2313,7 +1931,6 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
 
         if any_burned:
             consecutive_fails += 1
-            # Exponential backoff per worker — no shared event, no race
             backoff = min(consecutive_fails * 1.5, 15.0)
             cooldown_until = time.time() + backoff
             await asyncio.sleep(random.uniform(backoff * 0.5, backoff))
@@ -2325,11 +1942,19 @@ async def xtream_worker(wid: int, queue: asyncio.Queue, results_q: asyncio.Queue
             await asyncio.sleep(random.uniform(0.05, 0.2))
 
 
+# Xtream Job Globals (Required for memory optimized worker access)
+url_bloom = None
+high_urls = None
+med_urls = None
+low_urls = None
+_MED_CAP = 200_000
+_LOW_CAP = 50_000
+domain_counts = None
+incremental_f = None
+
 async def run_xtream_job(chat_id: int, dorks: list, context):
-    """
-    XTREAM MODE v21: Multi-engine (Yahoo/Bing/Both), adaptive throttle, domain stats.
-    """
-    from collections import Counter
+    global url_bloom, high_urls, med_urls, low_urls, domain_counts, incremental_f
+
     sess_cfg      = get_session(chat_id)
     use_tor       = sess_cfg.get("tor", False)
     min_score     = sess_cfg.get("min_score", 30)
@@ -2348,9 +1973,8 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     workers_n     = XTREAM_WORKERS_PER_CHUNK
     total_workers = n_chunks * workers_n
 
-    # Adaptive concurrency semaphore — starts full, shrinks on high captcha rate
     rate_limiter    = asyncio.Semaphore(total_workers)
-    captcha_counter = [0]   # shared mutable counter (list avoids closure rebind)
+    captcha_counter = [0]
 
     alive_proxies = sum(1 for p in _proxy_pool if p["alive"])
     proxy_info = (
@@ -2377,8 +2001,8 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     pool = XtreamSessionPool(size=XTREAM_SESSION_POOL_SIZE, engine=xtream_engine)
     await pool.initialize(use_tor=use_tor)
 
-    queue     = asyncio.Queue(maxsize=total_dorks + 10)
-    results_q = asyncio.Queue(maxsize=total_dorks * 2)
+    queue     = asyncio.Queue()
+    results_q = asyncio.Queue(maxsize=1000)
     stop_ev   = asyncio.Event()
     active_stop_evs[chat_id] = stop_ev
 
@@ -2394,21 +2018,25 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     ]
 
     processed = 0; total_raw = 0; total_captcha = 0
-    seen_norm: set  = set()   # normalized URL set for smarter dedup
-    seen_urls: set  = set()   # original URL set
-    all_scored: list = []
+
+    _bloom_cap = max(total_dorks * XTREAM_PAGES_PER_DORK * max(max_res, 10) * 3, 200_000)
+    url_bloom  = BloomFilter(capacity=_bloom_cap)
+    log.info(f"[XTREAM] Bloom filter: capacity={_bloom_cap:,} mem={url_bloom.memory_mb:.1f} MB")
+
+    high_urls = []
+    med_urls  = []
+    low_urls  = []
+    total_kept = 0
+    domain_counts = Counter()
+
     last_edit  = 0.0
     peak_rps   = 0.0
     last_rps_t = time.time(); rps_count = 0; current_rps = 0.0
 
-    # Temp file opened for incremental writes
-    tmp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
-                                            prefix=f"xtream_{chat_id}_", suffix=".txt")
-    tmp_path = tmp_file.name
-    tmp_file.write(f"# XTREAM Mode v21 — {engine_display}\n# {datetime.now()}\n")
-    tmp_file.write(f"# Dorks: {total_dorks} | Pages: {XTREAM_PAGES_PER_DORK} | Workers: {total_workers}\n\n")
-    tmp_file.close()
-    incremental_f = open(tmp_path, "a", encoding="utf-8")
+    tmp_path = OUTPUT_DIR / f"xtream_{chat_id}_{int(time.time())}.txt"
+    incremental_f = open(tmp_path, "w", encoding="utf-8")
+    incremental_f.write(f"# XTREAM Mode v24.0 — {engine_display}\n# {datetime.now()}\n")
+    incremental_f.write(f"# Dorks: {total_dorks} | Pages: {XTREAM_PAGES_PER_DORK} | Workers: {total_workers}\n\n")
 
     async def _job_timeout():
         await asyncio.sleep(JOB_TIMEOUT)
@@ -2418,24 +2046,15 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     try:
         while processed < total_dorks and not stop_ev.is_set():
             try:
-                dork, engine, scored, raw_cnt, was_captcha = await asyncio.wait_for(
+                dork, engine, kept_cnt, raw_cnt, was_captcha = await asyncio.wait_for(
                     results_q.get(), timeout=CHUNK_STALL_TIMEOUT)
             except asyncio.TimeoutError:
                 if all(t.done() for t in worker_tasks): break
                 continue
 
-            processed  += 1; total_raw += raw_cnt; rps_count += raw_cnt
+            processed  += 1; total_raw += raw_cnt; rps_count += raw_cnt; total_kept += kept_cnt
             if was_captcha: total_captcha += 1
 
-            for sc, url in scored:
-                norm = _normalize_url_for_dedup(url)
-                if norm not in seen_norm:
-                    seen_norm.add(norm); seen_urls.add(url)
-                    all_scored.append((sc, url))
-                    try: incremental_f.write(f"{url}\n")
-                    except Exception: pass
-
-            # Adaptive throttle: if captcha rate spikes, tighten the semaphore
             if processed > 0 and processed % 20 == 0:
                 captcha_rate = captcha_counter[0] / max(processed, 1)
                 if captcha_rate > XTREAM_CAPTCHA_RATE_LIMIT:
@@ -2454,20 +2073,19 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
                 elapsed = int(time.time() - start_time)
                 eta     = int((elapsed / processed) * (total_dorks - processed)) if processed else 0
                 captcha_rate = captcha_counter[0] / max(processed, 1)
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=status_msg.message_id,
-                        text=(f"⚡⚡⚡ XTREAM RUNNING ⚡⚡⚡\n{'━'*30}\n"
-                              f"[{bar}] {pct}%\n"
-                              f"✅ Dorks    : {processed}/{total_dorks}\n"
-                              f"🔍 Raw URLs : {total_raw}\n"
-                              f"🎯 Targets  : {len(all_scored)}\n"
-                              f"📊 RPS      : {current_rps:.0f} (peak {peak_rps:.0f})\n"
-                              f"🛡 Captchas : {total_captcha} ({captcha_rate:.0%})\n"
-                              f"⏱ {elapsed}s | ETA {eta}s\n{'━'*30}"),
-                    )
-                    last_edit = time.time()
-                except Exception: pass
+                
+                await safe_edit_message(
+                    context, chat_id, status_msg.message_id,
+                    text=(f"⚡⚡⚡ XTREAM RUNNING ⚡⚡⚡\n{'━'*30}\n"
+                          f"[{bar}] {pct}%\n"
+                          f"✅ Dorks    : {processed}/{total_dorks}\n"
+                          f"🔍 Raw URLs : {total_raw}\n"
+                          f"🎯 Targets  : {total_kept}\n"
+                          f"📊 RPS      : {current_rps:.0f} (peak {peak_rps:.0f})\n"
+                          f"🛡 Captchas : {total_captcha} ({captcha_rate:.0%})\n"
+                          f"⏱ {elapsed}s | ETA {eta}s\n{'━'*30}"),
+                )
+                last_edit = time.time()
 
         stop_ev.set()
         for t in worker_tasks: t.cancel()
@@ -2488,60 +2106,57 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    all_scored.sort(reverse=True)
-    elapsed = int(time.time() - start_time)
-    avg_rps = total_raw / max(elapsed, 1)
+    elapsed     = int(time.time() - start_time)
+    avg_rps     = total_raw / max(elapsed, 1)
+    top_domains = domain_counts.most_common(10)
 
-    # Build categorised + domain-stats output file
-    high = [(s, u) for s, u in all_scored if s >= 70]
-    med  = [(s, u) for s, u in all_scored if 40 <= s < 70]
-    low  = [(s, u) for s, u in all_scored if s < 40]
-    domain_counts = Counter(extract_domain(u) for _, u in all_scored)
-    top_domains   = domain_counts.most_common(10)
+    high_urls.sort(reverse=True)
+    med_urls.sort(reverse=True)
+    low_urls.sort(reverse=True)
 
     with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(f"# XTREAM Mode v21 — {engine_display}\n# {datetime.now()}\n")
-        f.write(f"# Dorks: {total_dorks} | Raw: {total_raw} | Targets: {len(all_scored)}\n")
+        f.write(f"# XTREAM Mode v24.0 — {engine_display}\n# {datetime.now()}\n")
+        f.write(f"# Dorks: {total_dorks} | Raw: {total_raw} | Targets: {total_kept}\n")
         f.write(f"# Avg RPS: {avg_rps:.0f} | Peak RPS: {peak_rps:.0f} | Time: {elapsed}s\n")
-        f.write(f"# Captchas: {total_captcha} | Min-score: {min_score}\n\n")
+        f.write(f"# Captchas: {total_captcha} | Min-score: {min_score}\n")
+        f.write(f"# Bloom filter: {url_bloom.memory_mb:.1f} MB (capacity {_bloom_cap:,})\n\n")
         if top_domains:
             f.write("# ── TOP DOMAINS ────────────────────────\n")
             for dom, cnt in top_domains:
                 f.write(f"# {cnt:>4}  {dom}\n")
             f.write("\n")
-        if high:
-            f.write(f"# ── HIGH VALUE (≥70) — {len(high)} ──────────────\n")
-            for _, u in high: f.write(f"{u}\n")
-        if med:
-            f.write(f"\n# ── MEDIUM (40-69) — {len(med)} ──────────────\n")
-            for _, u in med: f.write(f"{u}\n")
-        if low and min_score < 40:
-            f.write(f"\n# ── LOW (<40) — {len(low)} ──────────────\n")
-            for _, u in low: f.write(f"{u}\n")
+        if high_urls:
+            f.write(f"# ── HIGH VALUE (≥70) — {len(high_urls)} ──────────────\n")
+            for _, u in high_urls: f.write(f"{u}\n")
+        if med_urls:
+            f.write(f"\n# ── MEDIUM (40-69) — {len(med_urls)}" + (" [CAPPED]" if len(med_urls) >= _MED_CAP else "") + " ──\n")
+            for _, u in med_urls: f.write(f"{u}\n")
+        if low_urls and min_score < 40:
+            f.write(f"\n# ── LOW (<40) — {len(low_urls)}" + (" [CAPPED]" if len(low_urls) >= _LOW_CAP else "") + " ──\n")
+            for _, u in low_urls: f.write(f"{u}\n")
 
     dom_summary = "\n".join(f"  {cnt}× {d}" for d, cnt in top_domains[:5]) if top_domains else "  (none)"
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=status_msg.message_id,
-            text=(f"🏁 XTREAM COMPLETE!\n{'━'*30}\n"
-                  f"📋 Dorks       : {total_dorks}\n"
-                  f"🔍 Raw URLs    : {total_raw}\n"
-                  f"🎯 Targets     : {len(all_scored)}\n"
-                  f"📊 Avg RPS     : {avg_rps:.0f} | Peak: {peak_rps:.0f}\n"
-                  f"🛡 Captchas    : {total_captcha}\n"
-                  f"⏱ Total time  : {elapsed}s\n"
-                  f"{'━'*30}\n"
-                  f"🏆 Top domains:\n{dom_summary}"),
-        )
-    except Exception: pass
+    
+    await safe_edit_message(
+        context, chat_id, status_msg.message_id,
+        text=(f"🏁 XTREAM COMPLETE!\n{'━'*30}\n"
+              f"📋 Dorks       : {total_dorks}\n"
+              f"🔍 Raw URLs    : {total_raw}\n"
+              f"🎯 Targets     : {total_kept}\n"
+              f"📊 Avg RPS     : {avg_rps:.0f} | Peak: {peak_rps:.0f}\n"
+              f"🛡 Captchas    : {total_captcha}\n"
+              f"⏱ Total time  : {elapsed}s\n"
+              f"{'━'*30}\n"
+              f"🏆 Top domains:\n{dom_summary}"),
+    )
 
-    if all_scored:
+    if total_kept:
         with open(tmp_path, "rb") as f:
             await context.bot.send_document(
                 chat_id, f,
-                filename=f"xtream_{total_dorks}d_{len(all_scored)}u.txt",
-                caption=(f"⚡ XTREAM v21 RESULTS\n"
-                         f"🎯 {len(all_scored)} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
+                filename=f"xtream_{total_dorks}d_{total_kept}u.txt",
+                caption=(f"⚡ XTREAM v24.0 RESULTS\n"
+                         f"🎯 {total_kept} URLs | 📊 {avg_rps:.0f} avg / {peak_rps:.0f} peak RPS\n"
                          f"⏱ {elapsed}s | 🛡 {total_captcha} captchas"),
             )
     else:
@@ -2551,19 +2166,9 @@ async def run_xtream_job(chat_id: int, dorks: list, context):
     except OSError: pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── STANDARD WORKER / CHUNK / JOB (boosted to 200 RPS) ──────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── STANDARD WORKER / CHUNK / JOB ───────────────────────────────────────────
 async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
                        session, min_score, stop_ev, slowdown_ev, yahoo_pool=None):
-    """
-    Normal-mode dork worker.
-    When `yahoo_pool` is provided and the assigned engine is Yahoo, the worker
-    uses `fetch_all_pages_yahoo_adv` (advanced TLS rotation) instead of the
-    standard single-session fetch.  All other engines continue to use the
-    shared chunk session unchanged.
-    """
     eidx = wid % len(engines)
     empty_streak = consecutive_hits = 0
     while not stop_ev.is_set():
@@ -2575,13 +2180,11 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
         raw, degraded_cnt = [], 0
         try:
             if engine == "yahoo" and yahoo_pool is not None:
-                # ── Advanced TLS path — pool-managed sessions + 15 mirrors ──
                 raw, degraded_cnt = await asyncio.wait_for(
                     fetch_all_pages_yahoo_adv(yahoo_pool, dork, pages, max_res, chunk_id),
                     timeout=WORKER_FETCH_TIMEOUT,
                 )
             else:
-                # ── Standard path for Bing / DDG (or Yahoo without pool) ────
                 raw, degraded_cnt = await asyncio.wait_for(
                     fetch_all_pages(session, dork, engine, pages, max_res, chunk_id),
                     timeout=WORKER_FETCH_TIMEOUT,
@@ -2594,10 +2197,19 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
             queue.task_done(); raise
         except Exception as exc:
             log.warning(f"[C{chunk_id}][W{wid}] err: {exc}")
-        scored = filter_scored(raw, min_score)
+            
+        # Optimized memory pass
+        scored = []
+        for url in raw:
+            sc = score_url(url)
+            if sc >= min_score:
+                scored.append((sc, url))
+        scored.sort(reverse=True)
+        
         try: results_q.put_nowait((dork, engine, scored, len(raw), degraded_cnt))
         except asyncio.QueueFull: await results_q.put((dork, engine, scored, len(raw), degraded_cnt))
         queue.task_done()
+        
         if raw:
             consecutive_hits += 1; empty_streak = 0
             if consecutive_hits >= FAST_STREAK_THRESHOLD:
@@ -2613,32 +2225,45 @@ async def dork_worker(wid, chunk_id, queue, results_q, engines, pages, max_res,
             delay += random.uniform(1.0, 2.5)
         await asyncio.sleep(delay)
 
-
 async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score,
                      workers_n, progress_q, global_stop_ev, proxy=None):
     session = _make_isolated_session(use_tor=use_tor, proxy=proxy)
 
-    # ── Advanced Yahoo TLS pool — one pre-seeded session per worker ───────────
     yahoo_pool = None
     if "yahoo" in engines:
         yahoo_pool = NormalYahooSessionPool(size=max(workers_n, 2))
         await yahoo_pool.initialize()
 
-    queue = asyncio.Queue(maxsize=len(dorks) * 2)
+    queue     = asyncio.Queue()
     results_q = asyncio.Queue(maxsize=500)
     stop_ev = asyncio.Event(); slowdown_ev = asyncio.Event()
     for d in dorks: await queue.put(d)
     total = len(dorks); processed = empty_count = chunk_raw = chunk_degraded = 0
     chunk_scored = []
+    
     async def _watch_global():
+        await global_stop_ev.wait()
+        stop_ev.set()
+        
+    async def _watchdog():
+        """Triggers a stop if the queue stalls for over 2 minutes."""
+        last_progress = time.time()
         while not stop_ev.is_set():
-            if global_stop_ev.is_set(): stop_ev.set()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(30)
+            if time.time() - last_progress > 120:
+                log.error(f"[C{chunk_id}] Watchdog triggered! Job stalled for 2 mins.")
+                stop_ev.set()
+                break
+            if not results_q.empty():
+                last_progress = time.time()
+
     worker_tasks = [asyncio.create_task(dork_worker(i, chunk_id, queue, results_q,
                     engines, pages, max_res, session, min_score, stop_ev, slowdown_ev,
                     yahoo_pool=yahoo_pool))
                     for i in range(workers_n)]
     global_watcher = asyncio.create_task(_watch_global())
+    watchdog_task = asyncio.create_task(_watchdog())
+    
     try:
         while processed < total and not stop_ev.is_set():
             try:
@@ -2663,23 +2288,23 @@ async def run_chunk(chunk_id, dorks, engines, pages, max_res, use_tor, min_score
         await asyncio.gather(*worker_tasks, return_exceptions=True)
     except asyncio.CancelledError:
         stop_ev.set()
-        for t in worker_tasks: t.cancel()
+        for t in worker_tasks:
+            if not t.done(): t.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
         raise
     finally:
         global_watcher.cancel()
-        await asyncio.gather(global_watcher, return_exceptions=True)
+        watchdog_task.cancel()
+        await asyncio.gather(global_watcher, watchdog_task, return_exceptions=True)
         await session.close()
         if yahoo_pool is not None:
             await yahoo_pool.close_all()
     return {"chunk_id":chunk_id,"scored":chunk_scored,"raw_count":chunk_raw,
             "degraded_count":chunk_degraded,"processed":processed,"empty_count":empty_count}
 
-
 async def run_dork_job(chat_id, dorks, context):
     sess = get_session(chat_id)
 
-    # Route to xtream mode if enabled
     if sess.get("xtream", False):
         await run_xtream_job(chat_id, dorks, context)
         return
@@ -2709,13 +2334,7 @@ async def run_dork_job(chat_id, dorks, context):
     chunks = [dorks[i:i+chunk_size] for i in range(0, total_dorks, chunk_size)]
     actual_chunks = len(chunks)
 
-    tmp_file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False,
-                                            prefix=f"dork_{chat_id}_", suffix=".txt")
-    tmp_path = tmp_file.name
-    tmp_file.write(f"# Dork Parser v20.0 — SQL Targeted Results\n")
-    tmp_file.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    tmp_file.write(f"# Dorks: {total_dorks} | Pages: {pages_str} | Chunks: {actual_chunks}\n\n")
-    tmp_file.close()
+    tmp_path = OUTPUT_DIR / f"dork_{chat_id}_{int(time.time())}.txt"
 
     alive_proxies = sum(1 for p in _proxy_pool if p["alive"])
     if use_tor: proxy_info = "🧅 TOR"
@@ -2734,7 +2353,7 @@ async def run_dork_job(chat_id, dorks, context):
                  f"🔒 TLS      : {len(TLS_PROFILES)} profiles rotating\n")
     status_msg = await context.bot.send_message(
         chat_id,
-        f"🕷 DORK PARSER v21.0 — STARTED\n{'━'*30}\n"
+        f"🕷 DORK PARSER v24.0 — STARTED\n{'━'*30}\n"
         f"📋 Dorks    : {total_dorks}"
         + (f" (⚠️ {len(invalid_dorks)} skip)" if invalid_dorks else "")
         + f"\n📄 Pages    : {pages_str}\n"
@@ -2752,7 +2371,7 @@ async def run_dork_job(chat_id, dorks, context):
     progress_q = asyncio.Queue(maxsize=total_dorks * 2)
     chunk_counters = {i: {"processed":0,"total":len(chunks[i])} for i in range(actual_chunks)}
     agg_raw=[0]; agg_kept=[0]; last_edit=[0.0]; total_processed=[0]
-    rps_window=[time.time(), 0, 0.0]   # [last_t, count, current_rps]
+    rps_window=[time.time(), 0, 0.0]
 
     async def _status_updater():
         while not global_stop_ev.is_set():
@@ -2778,18 +2397,17 @@ async def run_dork_job(chat_id, dorks, context):
                 eta = int((elapsed/proc) * (total_dorks-proc)) if proc else 0
                 cinfo = " | ".join(f"C{i}:{chunk_counters[i]['processed']}/{chunk_counters[i]['total']}"
                                     for i in range(actual_chunks))
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=status_msg.message_id,
-                        text=(f"⚡ PARSING [{actual_chunks}c]\n{'━'*30}\n"
-                              f"[{bar}] {pct}%\n"
-                              f"✅ Done: {proc}/{total_dorks}\n"
-                              f"🎯 SQL: {agg_kept[0]} | 🗑 {agg_raw[0]-agg_kept[0]}\n"
-                              f"📊 RPS: {rps_window[2]:.0f}/sec\n"
-                              f"⏱ {elapsed}s | ETA {eta}s\n📦 {cinfo}\n{'━'*30}"),
-                    )
-                    last_edit[0] = time.time()
-                except Exception: pass
+                
+                await safe_edit_message(
+                    context, chat_id, status_msg.message_id,
+                    text=(f"⚡ PARSING [{actual_chunks}c]\n{'━'*30}\n"
+                          f"[{bar}] {pct}%\n"
+                          f"✅ Done: {proc}/{total_dorks}\n"
+                          f"🎯 SQL: {agg_kept[0]} | 🗑 {agg_raw[0]-agg_kept[0]}\n"
+                          f"📊 RPS: {rps_window[2]:.0f}/sec\n"
+                          f"⏱ {elapsed}s | ETA {eta}s\n📦 {cinfo}\n{'━'*30}"),
+                )
+                last_edit[0] = time.time()
             await asyncio.sleep(0.5)
 
     async def _job_timeout():
@@ -2819,12 +2437,15 @@ async def run_dork_job(chat_id, dorks, context):
         active_jobs.pop(chat_id, None)
         active_stop_evs.pop(chat_id, None)
 
-    seen_urls=set(); all_scored=[]; total_raw=total_degraded=failed_chunks=0
+    _total_est  = sum(r["raw_count"] for r in chunk_results if not isinstance(r, Exception))
+    _final_bloom = BloomFilter(capacity=max(_total_est * 2, 50_000))
+    all_scored=[]; total_raw=total_degraded=failed_chunks=0
     for result in chunk_results:
         if isinstance(result, Exception): failed_chunks += 1; continue
         for sc, url in result["scored"]:
-            if url not in seen_urls:
-                seen_urls.add(url); all_scored.append((sc, url))
+            norm = _normalize_url_for_dedup(url)
+            if not _final_bloom.add(f"final:{norm}"):
+                all_scored.append((sc, url))
         total_raw += result["raw_count"]
         total_degraded += result["degraded_count"]
     all_scored.sort(reverse=True)
@@ -2835,29 +2456,35 @@ async def run_dork_job(chat_id, dorks, context):
     high = [(s,u) for s,u in all_scored if s>=70]
     med  = [(s,u) for s,u in all_scored if 40<=s<70]
     low  = [(s,u) for s,u in all_scored if s<40]
-    with open(tmp_path, "a", encoding="utf-8") as f:
-        if high:
-            f.write(f"# HIGH (≥70) — {len(high)}\n")
-            for _,u in high: f.write(f"{u}\n")
-        if med:
-            f.write(f"\n# MEDIUM — {len(med)}\n")
-            for _,u in med: f.write(f"{u}\n")
-        if low and min_score < 40:
-            f.write(f"\n# LOW — {len(low)}\n")
-            for _,u in low: f.write(f"{u}\n")
-
+    
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=status_msg.message_id,
-            text=(f"🏁 JOB COMPLETE!\n{'━'*30}\n"
-                  f"📋 Dorks   : {total_dorks}\n📄 Pages   : {pages_str}\n"
-                  f"⚡ Chunks  : {actual_chunks}\n🔍 Raw     : {total_raw}\n"
-                  f"🎯 SQL     : {unique_cnt}\n🗑 Drop    : {total_raw-unique_cnt}\n"
-                  f"⚠️ Degraded: {total_degraded}\n"
-                  f"📊 Avg RPS : {avg_rps:.0f}/sec\n"
-                  f"⏱ Time    : {elapsed}s\n{'━'*30}"),
-        )
-    except Exception: pass
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(f"# Dork Parser v24.0 — SQL Targeted Results\n")
+            f.write(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"# Dorks: {total_dorks} | Pages: {pages_str} | Chunks: {actual_chunks}\n\n")
+            if high:
+                f.write(f"# HIGH (≥70) — {len(high)}\n")
+                for _,u in high: f.write(f"{u}\n")
+            if med:
+                f.write(f"\n# MEDIUM — {len(med)}\n")
+                for _,u in med: f.write(f"{u}\n")
+            if low and min_score < 40:
+                f.write(f"\n# LOW — {len(low)}\n")
+                for _,u in low: f.write(f"{u}\n")
+    except Exception as e:
+        log.error(f"Failed to write temp file: {e}")
+        return
+
+    await safe_edit_message(
+        context, chat_id, status_msg.message_id,
+        text=(f"🏁 JOB COMPLETE!\n{'━'*30}\n"
+              f"📋 Dorks   : {total_dorks}\n📄 Pages   : {pages_str}\n"
+              f"⚡ Chunks  : {actual_chunks}\n🔍 Raw     : {total_raw}\n"
+              f"🎯 SQL     : {unique_cnt}\n🗑 Drop    : {total_raw-unique_cnt}\n"
+              f"⚠️ Degraded: {total_degraded}\n"
+              f"📊 Avg RPS : {avg_rps:.0f}/sec\n"
+              f"⏱ Time    : {elapsed}s\n{'━'*30}"),
+    )
 
     if all_scored:
         with open(tmp_path, "rb") as f:
@@ -2866,16 +2493,15 @@ async def run_dork_job(chat_id, dorks, context):
                 caption=f"🎯 {unique_cnt} URLs | 📊 {avg_rps:.0f} RPS | ⏱ {elapsed}s")
     else:
         await context.bot.send_message(chat_id, "⚠️ No URLs matched filter.")
+        
     try: os.unlink(tmp_path)
     except OSError: pass
-
 
 # ─── UI HELPERS ──────────────────────────────────────────────────────────────
 def get_session(chat_id):
     if chat_id not in user_sessions:
         user_sessions[chat_id] = dict(DEFAULT_SESSION)
     return user_sessions[chat_id]
-
 
 def page_keyboard(selected):
     rows, row = [], []
@@ -2890,7 +2516,6 @@ def page_keyboard(selected):
         InlineKeyboardButton("✅ Confirm", callback_data="pg_confirm"),
     ])
     return InlineKeyboardMarkup(rows)
-
 
 def main_menu_keyboard(sess):
     return InlineKeyboardMarkup([
@@ -2909,7 +2534,6 @@ def main_menu_keyboard(sess):
          InlineKeyboardButton("📊 Status", callback_data="m_status")],
     ])
 
-
 def filter_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("0", callback_data="f_0"),
@@ -2923,12 +2547,9 @@ def filter_keyboard():
         [InlineKeyboardButton("🔙 Back", callback_data="m_back")],
     ])
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 # ─── COMMAND HANDLERS ────────────────────────────────────────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def cmd_start(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -2942,13 +2563,13 @@ async def cmd_start(update, context):
         proxy_status = "🔓 No proxies"
 
     await update.message.reply_text(
-        "🕷 DORK PARSER v20.0 — XTREAM EDITION\n"
+        "🕷 DORK PARSER v24.0 — XTREAM EDITION\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🆕 NEW in v20.0:\n"
-        "  ⚡ /xtream — 1000 URLs/sec Yahoo bruteforce\n"
-        f"  🔒 {len(TLS_PROFILES)} TLS fingerprints rotating\n"
-        "  🚀 200 URLs/sec standard mode\n"
-        "  🔘 Fully working inline keyboards\n\n"
+        "🆕 NEW in v24.0:\n"
+        "  🧠 TTL Memory Management (No leaks)\n"
+        "  🐕 Watchdog anti-stall system\n"
+        "  📉 Single-pass RAM optimization\n"
+        "  🛡 Telegram API RetryAfter safe\n\n"
         f"{proxy_status}\n\n"
         "📌 Core Commands:\n"
         "  /dork <q>     — single dork search\n"
@@ -2969,8 +2590,8 @@ async def cmd_start(update, context):
         reply_markup=main_menu_keyboard(sess),
     )
 
-
 async def cmd_dork(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Usage: /dork inurl:login.php?id=")
@@ -2990,15 +2611,13 @@ async def cmd_dork(update, context):
     )
     active_jobs[chat_id] = asyncio.create_task(run_dork_job(chat_id, [dork], context))
 
-
 async def cmd_xtream(update, context):
-    """Toggle XTREAM mode or set engine: /xtream [on|off|engine yahoo|bing|both]"""
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
 
     if context.args:
         arg0 = context.args[0].lower()
-        # Engine selection: /xtream engine yahoo|bing|both
         if arg0 == "engine" and len(context.args) >= 2:
             engine = context.args[1].lower()
             if engine not in ("yahoo", "bing", "both"):
@@ -3048,7 +2667,6 @@ async def cmd_xtream(update, context):
             f"Reverted to standard mode (~200 RPS, multi-engine)."
         )
 
-
 async def cmd_dorkcheck(update, context):
     if not context.args:
         await update.message.reply_text(
@@ -3075,7 +2693,6 @@ async def cmd_dorkcheck(update, context):
         lines.append(f"   {engine.upper():12s}: {translated[:80]}")
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_mutate(update, context):
     if not context.args:
         await update.message.reply_text("Usage: /mutate <dork> [n=10]"); return
@@ -3089,19 +2706,12 @@ async def cmd_mutate(update, context):
     for i, v in enumerate(variations, 1): lines.append(f"{i:>2}. {v}")
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_pages(update, context):
-    """
-    /pages              — open interactive keyboard
-    /pages 5            — set pages 1-5
-    /pages 1-10         — set page range (inclusive)
-    /pages 1,3,5,7      — set specific pages
-    """
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess    = get_session(chat_id)
 
     if not context.args:
-        # No args → open the interactive keyboard as before
         selected = sess.get("pages", [1])
         await update.message.reply_text(
             f"📄 SELECT PAGES (1–70)\n"
@@ -3116,21 +2726,17 @@ async def cmd_pages(update, context):
 
     try:
         if "-" in raw and "," not in raw:
-            # Range: "3-10"
             parts = raw.split("-", 1)
             start = max(1, min(int(parts[0].strip()), 70))
             end   = max(1, min(int(parts[1].strip()), 70))
-            if start > end:
-                start, end = end, start
+            if start > end: start, end = end, start
             pages = list(range(start, end + 1))
         elif "," in raw:
-            # Comma list: "1,3,5,7"
             pages = sorted(set(
                 max(1, min(int(x.strip()), 70))
                 for x in raw.split(",") if x.strip().isdigit()
             ))
         else:
-            # Single number N → pages 1..N
             n = max(1, min(int(raw), 70))
             pages = list(range(1, n + 1))
     except Exception:
@@ -3144,8 +2750,7 @@ async def cmd_pages(update, context):
         )
         return
 
-    if not pages:
-        pages = [1]
+    if not pages: pages = [1]
 
     sess["pages"] = pages
     label = (f"1–{pages[-1]}" if pages == list(range(1, pages[-1] + 1))
@@ -3155,8 +2760,8 @@ async def cmd_pages(update, context):
         f"📄 Total: {len(pages)} page(s)"
     )
 
-
 async def cmd_tor(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     global tor_enabled_users
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
@@ -3174,8 +2779,8 @@ async def cmd_tor(update, context):
     else:
         await update.message.reply_text(f"Tor is already {'ON' if new_val else 'OFF'}.")
 
-
 async def cmd_filter(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     sess = get_session(chat_id)
     try:
@@ -3187,7 +2792,6 @@ async def cmd_filter(update, context):
             f"Current: ≥{sess.get('min_score', 30)}\nPick:",
             reply_markup=filter_keyboard(),
         )
-
 
 async def cmd_settings(update, context):
     chat_id = update.effective_chat.id
@@ -3213,8 +2817,8 @@ async def cmd_settings(update, context):
         reply_markup=main_menu_keyboard(s),
     )
 
-
 async def cmd_workers(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         n = max(1, min(int(context.args[0]), MAX_WORKERS_PER_CHUNK))
@@ -3223,8 +2827,8 @@ async def cmd_workers(update, context):
     except Exception:
         await update.message.reply_text(f"Usage: /workers N (1-{MAX_WORKERS_PER_CHUNK})")
 
-
 async def cmd_chunks(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         n = max(1, min(int(context.args[0]), 8))
@@ -3232,7 +2836,6 @@ async def cmd_chunks(update, context):
         await update.message.reply_text(f"✅ Chunks: {n}")
     except Exception:
         await update.message.reply_text("Usage: /chunks N (1-8)")
-
 
 async def cmd_maxres(update, context):
     chat_id = update.effective_chat.id
@@ -3243,8 +2846,8 @@ async def cmd_maxres(update, context):
     except Exception:
         await update.message.reply_text("Usage: /maxres N (1-50)")
 
-
 async def cmd_engine(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     try:
         choice = context.args[0].lower()
@@ -3256,12 +2859,11 @@ async def cmd_engine(update, context):
     except Exception:
         await update.message.reply_text("Usage: /engine bing|yahoo|duckduckgo|all")
 
-
 async def cmd_clean(update, context):
     await update.message.reply_text("🧹 Upload a .txt with URLs (one per line).")
 
-
 async def cmd_stop(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     stop_ev = active_stop_evs.get(chat_id)
     job = active_jobs.get(chat_id)
@@ -3274,7 +2876,6 @@ async def cmd_stop(update, context):
     else:
         await update.message.reply_text("💤 No active job.")
 
-
 async def cmd_status(update, context):
     chat_id = update.effective_chat.id
     job = active_jobs.get(chat_id)
@@ -3284,12 +2885,11 @@ async def cmd_status(update, context):
         f"{'⚡ Running' if job and not job.done() else '💤 Idle'}\nMode: {mode}"
     )
 
-
-# ─── PROXY COMMAND HANDLERS (unchanged) ──────────────────────────────────────
+# ─── PROXY COMMAND HANDLERS ──────────────────────────────────────────────────
 _awaiting_bulk_proxy: set = set()
 
-
 async def cmd_addproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         await update.message.reply_text(
             "➕ ADD PROXY\nUsage: /addproxy <proxy>\n\n"
@@ -3309,25 +2909,22 @@ async def cmd_addproxy(update, context):
         f"🔍 Auto-detecting {p['host']}:{p['port']}...")
     ok = await detect_proxy_protocol(p)
     if not ok:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id, message_id=wait_msg.message_id,
+        await safe_edit_message(context, update.effective_chat.id, wait_msg.message_id,
             text=f"❌ FAILED\n{p['host']}:{p['port']}\nNot added."); return
     async with _proxy_pool_lock:
         _proxy_pool.append(p); _persist_proxies()
-    await context.bot.edit_message_text(
-        chat_id=update.effective_chat.id, message_id=wait_msg.message_id,
+    await safe_edit_message(context, update.effective_chat.id, wait_msg.message_id,
         text=(f"✅ ADDED\n🔌 {p['protocol'].upper()}\n"
               f"🌐 {p['host']}:{p['port']}\n"
               f"⏱ {int(p['latency'])} ms\n📦 Pool: {len(_proxy_pool)}"))
 
-
 async def cmd_addproxies(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     _awaiting_bulk_proxy.add(chat_id)
     await update.message.reply_text(
         "📥 BULK PROXY IMPORT\nSend list as NEXT message (one per line).\n"
         "Or upload a .txt file. Auto-detects SOCKS5/4/HTTP/HTTPS.")
-
 
 async def _bulk_add_proxies(chat_id, lines, context):
     parsed = []; invalid = 0
@@ -3355,12 +2952,10 @@ async def _bulk_add_proxies(chat_id, lines, context):
     async def _progress(done, total, alive):
         if time.monotonic() - last_edit[0] < 2.5: return
         pct = int(done / total * 100) if total else 100
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=status_msg.message_id,
-                text=f"🔍 {pct}%\n✅ {done}/{total}\n💚 Alive: {alive}")
-            last_edit[0] = time.monotonic()
-        except Exception: pass
+        await safe_edit_message(context, chat_id, status_msg.message_id,
+            text=f"🔍 {pct}%\n✅ {done}/{total}\n💚 Alive: {alive}")
+        last_edit[0] = time.monotonic()
+        
     alive, dead = await check_proxies_bulk(unique, progress_cb=_progress)
     added = []
     async with _proxy_pool_lock:
@@ -3370,16 +2965,13 @@ async def _bulk_add_proxies(chat_id, lines, context):
     breakdown = {}
     for p in added: breakdown[p["protocol"]] = breakdown.get(p["protocol"], 0) + 1
     bd = "\n".join(f"   • {k.upper()}: {v}" for k, v in breakdown.items()) or "   (none)"
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id, message_id=status_msg.message_id,
-            text=(f"✅ COMPLETE\n📥 {len(lines)} | ❌ {invalid} | 🔁 {dup_count}\n"
-                  f"💀 Dead: {dead}\n💚 Added: {len(added)}\n"
-                  f"🔌 Breakdown:\n{bd}\n📦 Pool: {len(_proxy_pool)}"))
-    except Exception: pass
-
+    await safe_edit_message(context, chat_id, status_msg.message_id,
+        text=(f"✅ COMPLETE\n📥 {len(lines)} | ❌ {invalid} | 🔁 {dup_count}\n"
+              f"💀 Dead: {dead}\n💚 Added: {len(added)}\n"
+              f"🔌 Breakdown:\n{bd}\n📦 Pool: {len(_proxy_pool)}"))
 
 async def cmd_proxycheck(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not _proxy_pool:
         await update.message.reply_text("📭 Empty."); return
     status_msg = await update.message.reply_text(f"🔍 Re-checking {len(_proxy_pool)}...")
@@ -3387,22 +2979,17 @@ async def cmd_proxycheck(update, context):
     async def _progress(done, total, alive):
         if time.monotonic() - last_edit[0] < 2.5: return
         pct = int(done / total * 100) if total else 100
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id, message_id=status_msg.message_id,
-                text=f"🔍 {pct}%\n✅ {done}/{total}\n💚 Alive: {alive}")
-            last_edit[0] = time.monotonic()
-        except Exception: pass
+        await safe_edit_message(context, update.effective_chat.id, status_msg.message_id,
+            text=f"🔍 {pct}%\n✅ {done}/{total}\n💚 Alive: {alive}")
+        last_edit[0] = time.monotonic()
+        
     alive, dead = await check_proxies_bulk(list(_proxy_pool), progress_cb=_progress)
     _persist_proxies()
-    try:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id, message_id=status_msg.message_id,
-            text=f"✅ DONE\n📦 {len(_proxy_pool)} | 💚 {alive} | 💀 {dead}")
-    except Exception: pass
-
+    await safe_edit_message(context, update.effective_chat.id, status_msg.message_id,
+        text=f"✅ DONE\n📦 {len(_proxy_pool)} | 💚 {alive} | 💀 {dead}")
 
 async def cmd_proxyclean(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     async with _proxy_pool_lock:
         before = len(_proxy_pool)
         _proxy_pool[:] = [p for p in _proxy_pool if p["alive"]]
@@ -3410,8 +2997,8 @@ async def cmd_proxyclean(update, context):
         _persist_proxies()
     await update.message.reply_text(f"🧹 Removed {removed}\n💚 Remaining: {len(_proxy_pool)}")
 
-
 async def cmd_removeproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         if not _proxy_pool:
             await update.message.reply_text("📭 Empty."); return
@@ -3436,8 +3023,8 @@ async def cmd_removeproxy(update, context):
                 await update.message.reply_text(f"🗑 {arg}"); return
     await update.message.reply_text("❌ Not found.")
 
-
 async def cmd_proxylist(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not _proxy_pool:
         await update.message.reply_text("📭 Empty.\nUse /addproxy or /addproxies."); return
     alive = sum(1 for p in _proxy_pool if p["alive"])
@@ -3455,8 +3042,8 @@ async def cmd_proxylist(update, context):
     if len(_proxy_pool) > 50: lines.append(f"… +{len(_proxy_pool)-50}")
     await update.message.reply_text("\n".join(lines))
 
-
 async def cmd_testproxy(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     if not context.args:
         await update.message.reply_text("Usage: /testproxy <line>"); return
     line = " ".join(context.args).strip()
@@ -3470,12 +3057,7 @@ async def cmd_testproxy(update, context):
                f"🌐 {p['host']}:{p['port']}\n⏱ {int(p['latency'])} ms")
     else:
         msg = f"❌ FAILED\n{p['host']}:{p['port']}"
-    try:
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id, message_id=wait.message_id, text=msg)
-    except Exception:
-        await update.message.reply_text(msg)
-
+    await safe_edit_message(context, update.effective_chat.id, wait.message_id, text=msg)
 
 # ─── FILE DETECTION ──────────────────────────────────────────────────────────
 def _looks_like_url_list(lines):
@@ -3483,16 +3065,15 @@ def _looks_like_url_list(lines):
     if not non_empty: return False
     return sum(1 for l in non_empty if l.strip().startswith("http")) / len(non_empty) >= 0.5
 
-
 def _looks_like_proxy_list(lines):
     non_empty = [l for l in lines if l.strip() and not l.startswith("#")]
     if not non_empty: return False
     proxy_count = sum(1 for l in non_empty if parse_proxy_line(l.split("#", 1)[0].strip()))
     return proxy_count / len(non_empty) >= 0.6
 
-
 # ─── DOCUMENT / TEXT HANDLERS ────────────────────────────────────────────────
 async def handle_document(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     doc = update.message.document
     if chat_id in active_jobs and not active_jobs[chat_id].done():
@@ -3524,8 +3105,8 @@ async def handle_document(update, context):
     except Exception as exc:
         await update.message.reply_text(f"❌ Error: {exc}")
 
-
 async def handle_text(update, context):
+    if not is_allowed(update): await deny_unauthorized(update); return
     chat_id = update.effective_chat.id
     if chat_id in _awaiting_bulk_proxy:
         _awaiting_bulk_proxy.discard(chat_id)
@@ -3549,20 +3130,14 @@ async def handle_text(update, context):
             "/xtream — 1000 RPS mode\n"
             "/dorkcheck — validate  |  /mutate — variations")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ─── FIXED CALLBACK HANDLER — covers ALL inline buttons ──────────────────────
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─── CALLBACK HANDLER ────────────────────────────────────────────────────────
 async def handle_callback(update, context):
-    """Fully-working callback dispatcher for every inline keyboard button."""
     query = update.callback_query
-    await query.answer()      # always ACK first to remove loading spinner
+    await query.answer()
     data = query.data
     chat_id = query.message.chat_id
     sess = get_session(chat_id)
 
-    # ── Page selector ──────────────────────────────────────────────────────
     if data.startswith("pg_"):
         cmd = data[3:]
         selected = list(sess.get("pages", [1]))
@@ -3570,11 +3145,8 @@ async def handle_callback(update, context):
         elif cmd == "clear": selected = []
         elif cmd == "confirm":
             sess["pages"] = selected or [1]
-            try:
-                await query.edit_message_text(
-                    f"✅ Pages saved: {', '.join(str(p) for p in sorted(sess['pages']))}"
-                )
-            except Exception: pass
+            await safe_edit_message(context, chat_id, query.message.message_id,
+                text=f"✅ Pages saved: {', '.join(str(p) for p in sorted(sess['pages']))}")
             return
         else:
             try:
@@ -3584,86 +3156,67 @@ async def handle_callback(update, context):
                 selected = sorted(set(selected))
             except ValueError: pass
         sess["pages"] = selected
-        try:
-            await query.edit_message_text(
-                f"📄 SELECT PAGES\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
-                reply_markup=page_keyboard(selected),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=f"📄 SELECT PAGES\nSelected: {', '.join(str(p) for p in selected) or 'none'}",
+            reply_markup=page_keyboard(selected))
         return
 
-    # ── Filter keyboard ────────────────────────────────────────────────────
     if data.startswith("f_"):
         try:
             n = int(data[2:])
             sess["min_score"] = n
-            await query.edit_message_text(
-                f"🛡 SQL Filter set: ≥{n}",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except (ValueError, Exception): pass
+            await safe_edit_message(context, chat_id, query.message.message_id,
+                text=f"🛡 SQL Filter set: ≥{n}", reply_markup=main_menu_keyboard(sess))
+        except Exception: pass
         return
 
-    # ── Main menu buttons ──────────────────────────────────────────────────
     if data == "m_bulk":
-        try:
-            await query.edit_message_text(
-                "📂 BULK UPLOAD\n━━━━━━━━━━━━━━━\n"
-                "Send a .txt file. Auto-detected:\n"
-                "  • Dork list → run search\n"
-                "  • URL list  → run cleaner\n"
-                "  • Proxy list → import to pool\n\n"
-                "Or paste multiple lines directly in chat.",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=("📂 BULK UPLOAD\n━━━━━━━━━━━━━━━\n"
+                  "Send a .txt file. Auto-detected:\n"
+                  "  • Dork list → run search\n"
+                  "  • URL list  → run cleaner\n"
+                  "  • Proxy list → import to pool\n\n"
+                  "Or paste multiple lines directly in chat."),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_single":
-        try:
-            await query.edit_message_text(
-                "🔍 SINGLE DORK SEARCH\n━━━━━━━━━━━━━━━\n"
-                "Usage: /dork <query>\n\n"
-                "Examples:\n"
-                "  /dork inurl:login.php?id=\n"
-                "  /dork intitle:\"index of\" filetype:php\n"
-                "  /dork site:example.com -site:blog.example.com\n\n"
-                "💡 /dorkcheck <q> — validate before running\n"
-                "💡 /mutate <q> — generate variations",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=("🔍 SINGLE DORK SEARCH\n━━━━━━━━━━━━━━━\n"
+                  "Usage: /dork <query>\n\n"
+                  "Examples:\n"
+                  "  /dork inurl:login.php?id=\n"
+                  "  /dork intitle:\"index of\" filetype:php\n"
+                  "  /dork site:example.com -site:blog.example.com\n\n"
+                  "💡 /dorkcheck <q> — validate before running\n"
+                  "💡 /mutate <q> — generate variations"),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_pages":
-        try:
-            await query.edit_message_text(
-                f"📄 SELECT PAGES (1–70)\nCurrently: {', '.join(str(p) for p in sess.get('pages', [1]))}",
-                reply_markup=page_keyboard(sess.get("pages", [1])),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=f"📄 SELECT PAGES (1–70)\nCurrently: {', '.join(str(p) for p in sess.get('pages', [1]))}",
+            reply_markup=page_keyboard(sess.get("pages", [1])))
         return
 
     if data == "m_settings":
         alive = sum(1 for p in _proxy_pool if p["alive"])
-        try:
-            await query.edit_message_text(
-                f"⚙️ SETTINGS\n━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⚡ Chunks   : {sess.get('chunks', N_CHUNKS)}\n"
-                f"🔧 Workers  : {sess.get('workers', WORKERS_PER_CHUNK)}/chunk\n"
-                f"📄 Pages    : {', '.join(str(p) for p in sess.get('pages',[1]))}\n"
-                f"🔍 Engines  : {'+'.join(e.upper() for e in sess.get('engines',ENGINES))}\n"
-                f"📊 Max/page : {sess.get('max_results', MAX_RESULTS)}\n"
-                f"🛡 SQL ≥    : {sess.get('min_score', 30)}\n"
-                f"🧅 Tor      : {'ON' if sess.get('tor') else 'OFF'}\n"
-                f"⚡ Xtream   : {'ON 🚀' if sess.get('xtream') else 'OFF'}\n"
-                f"🔄 Proxies  : {alive}/{len(_proxy_pool)} alive\n"
-                f"🔒 TLS pool : {len(TLS_PROFILES)} profiles\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Change with: /workers /chunks /engine /maxres /filter /tor /xtream",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=(f"⚙️ SETTINGS\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                  f"⚡ Chunks   : {sess.get('chunks', N_CHUNKS)}\n"
+                  f"🔧 Workers  : {sess.get('workers', WORKERS_PER_CHUNK)}/chunk\n"
+                  f"📄 Pages    : {', '.join(str(p) for p in sess.get('pages',[1]))}\n"
+                  f"🔍 Engines  : {'+'.join(e.upper() for e in sess.get('engines',ENGINES))}\n"
+                  f"📊 Max/page : {sess.get('max_results', MAX_RESULTS)}\n"
+                  f"🛡 SQL ≥    : {sess.get('min_score', 30)}\n"
+                  f"🧅 Tor      : {'ON' if sess.get('tor') else 'OFF'}\n"
+                  f"⚡ Xtream   : {'ON 🚀' if sess.get('xtream') else 'OFF'}\n"
+                  f"🔄 Proxies  : {alive}/{len(_proxy_pool)} alive\n"
+                  f"🔒 TLS pool : {len(TLS_PROFILES)} profiles\n"
+                  f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                  f"Change with: /workers /chunks /engine /maxres /filter /tor /xtream"),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_tor":
@@ -3676,64 +3229,48 @@ async def handle_callback(update, context):
         elif not sess["tor"] and old_val:
             tor_enabled_users = max(0, tor_enabled_users - 1)
             if tor_enabled_users == 0: stop_tor_rotation()
-        try:
-            await query.edit_message_text(
-                f"🧅 TOR {'ENABLED — rotates every 2 min' if sess['tor'] else 'DISABLED'}",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=f"🧅 TOR {'ENABLED — rotates every 2 min' if sess['tor'] else 'DISABLED'}",
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_xtream":
         sess["xtream"] = not sess.get("xtream", False)
         if sess["xtream"]:
-            msg = (
-                f"⚡⚡⚡ XTREAM MODE ENABLED ⚡⚡⚡\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 Yahoo bruteforce @ 1000 RPS\n"
-                f"⚙️ {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} workers, {XTREAM_SESSION_POOL_SIZE} sessions\n"
-                f"🛡 {len(TLS_PROFILES)} TLS profiles rotating\n"
-                f"💡 Now /dork or upload .txt to run xtream"
-            )
+            msg = (f"⚡⚡⚡ XTREAM MODE ENABLED ⚡⚡⚡\n"
+                   f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                   f"🎯 Yahoo bruteforce @ 1000 RPS\n"
+                   f"⚙️ {XTREAM_WORKERS_PER_CHUNK*XTREAM_CHUNKS} workers, {XTREAM_SESSION_POOL_SIZE} sessions\n"
+                   f"🛡 {len(TLS_PROFILES)} TLS profiles rotating\n"
+                   f"💡 Now /dork or upload .txt to run xtream")
         else:
             msg = "⏸ XTREAM disabled. Reverted to standard mode."
-        try:
-            await query.edit_message_text(msg, reply_markup=main_menu_keyboard(sess))
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=msg, reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_filter":
-        try:
-            await query.edit_message_text(
-                f"🛡 SQL FILTER\nCurrent: ≥{sess.get('min_score', 30)}\n"
-                f"Higher = stricter / fewer URLs but better quality.\n\n"
-                f"Pick a threshold:",
-                reply_markup=filter_keyboard(),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=(f"🛡 SQL FILTER\nCurrent: ≥{sess.get('min_score', 30)}\n"
+                  f"Higher = stricter / fewer URLs but better quality.\n\n"
+                  f"Pick a threshold:"),
+            reply_markup=filter_keyboard())
         return
 
     if data == "m_clean":
-        try:
-            await query.edit_message_text(
-                "🧹 URL CLEANER\n━━━━━━━━━━━━━━━\n"
-                "Upload a .txt with URLs (auto-detected).\n"
-                "Removes: blocked domains, no-query, >200 chars, dupes, invalid.\n\n"
-                "Or paste a URL list directly in chat.",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=("🧹 URL CLEANER\n━━━━━━━━━━━━━━━\n"
+                  "Upload a .txt with URLs (auto-detected).\n"
+                  "Removes: blocked domains, no-query, >200 chars, dupes, invalid.\n\n"
+                  "Or paste a URL list directly in chat."),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_proxylist":
         if not _proxy_pool:
-            try:
-                await query.edit_message_text(
-                    "📭 No proxies loaded.\n"
-                    "Use /addproxy or /addproxies to add some.",
-                    reply_markup=main_menu_keyboard(sess),
-                )
-            except Exception: pass
+            await safe_edit_message(context, chat_id, query.message.message_id,
+                text="📭 No proxies loaded.\nUse /addproxy or /addproxies to add some.",
+                reply_markup=main_menu_keyboard(sess))
             return
         alive = sum(1 for p in _proxy_pool if p["alive"])
         breakdown = {}
@@ -3749,94 +3286,71 @@ async def handle_callback(update, context):
             lines.append(f"{i:>2}. {mark} {proxy_display(p)}  {lat}")
         if len(_proxy_pool) > 20:
             lines.append(f"… +{len(_proxy_pool)-20} more (use /proxylist for full)")
-        try:
-            await query.edit_message_text("\n".join(lines),
-                reply_markup=main_menu_keyboard(sess))
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text="\n".join(lines), reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_proxycheck":
         if not _proxy_pool:
-            try:
-                await query.edit_message_text("📭 No proxies to check.",
-                    reply_markup=main_menu_keyboard(sess))
-            except Exception: pass
+            await safe_edit_message(context, chat_id, query.message.message_id,
+                text="📭 No proxies to check.", reply_markup=main_menu_keyboard(sess))
             return
-        try:
-            await query.edit_message_text(f"🔍 Re-checking {len(_proxy_pool)} proxies...")
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=f"🔍 Re-checking {len(_proxy_pool)} proxies...")
         last_edit = [0.0]
         async def _progress(done, total, alive):
             if time.monotonic() - last_edit[0] < 2.5: return
-            try:
-                await query.edit_message_text(
-                    f"🔍 {int(done/total*100)}%\n✅ {done}/{total}\n💚 Alive: {alive}")
-                last_edit[0] = time.monotonic()
-            except Exception: pass
+            await safe_edit_message(context, chat_id, query.message.message_id,
+                text=f"🔍 {int(done/total*100)}%\n✅ {done}/{total}\n💚 Alive: {alive}")
+            last_edit[0] = time.monotonic()
+            
         alive, dead = await check_proxies_bulk(list(_proxy_pool), progress_cb=_progress)
         _persist_proxies()
-        try:
-            await query.edit_message_text(
-                f"✅ Check done\n📦 {len(_proxy_pool)} | 💚 {alive} | 💀 {dead}",
-                reply_markup=main_menu_keyboard(sess))
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=f"✅ Check done\n📦 {len(_proxy_pool)} | 💚 {alive} | 💀 {dead}",
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_status":
         job = active_jobs.get(chat_id)
         running = bool(job and not job.done())
         mode = "⚡ XTREAM (1000 RPS)" if sess.get("xtream") else "🕷 Standard (~200 RPS)"
-        try:
-            await query.edit_message_text(
-                f"📊 STATUS\n━━━━━━━━━━━━━━━\n"
-                f"State: {'⚡ Running' if running else '💤 Idle'}\n"
-                f"Mode : {mode}\n"
-                f"Tor  : {'ON' if sess.get('tor') else 'OFF'}\n"
-                f"Filt : ≥{sess.get('min_score', 30)}",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=(f"📊 STATUS\n━━━━━━━━━━━━━━━\n"
+                  f"State: {'⚡ Running' if running else '💤 Idle'}\n"
+                  f"Mode : {mode}\n"
+                  f"Tor  : {'ON' if sess.get('tor') else 'OFF'}\n"
+                  f"Filt : ≥{sess.get('min_score', 30)}"),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_help":
-        try:
-            await query.edit_message_text(
-                "📖 HELP\n━━━━━━━━━━━━━━━\n"
-                "/dork <q>     — search\n"
-                "/xtream       — toggle 1000 RPS mode\n"
-                "/dorkcheck    — validate\n"
-                "/mutate       — variations\n"
-                "/pages        — page selector\n"
-                "/workers N    — 1-60\n"
-                "/chunks N     — 1-8\n"
-                "/engine X     — bing|yahoo|ddg|all\n"
-                "/tor          — toggle Tor\n"
-                "/filter N     — SQL ≥ N\n"
-                "/stop         — stop job\n\n"
-                "Proxies:\n"
-                "/addproxy /addproxies /proxylist\n"
-                "/proxycheck /proxyclean /testproxy\n"
-                "/removeproxy [i]",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text=("📖 HELP\n━━━━━━━━━━━━━━━\n"
+                  "/dork <q>     — search\n"
+                  "/xtream       — toggle 1000 RPS mode\n"
+                  "/dorkcheck    — validate\n"
+                  "/mutate       — variations\n"
+                  "/pages        — page selector\n"
+                  "/workers N    — 1-60\n"
+                  "/chunks N     — 1-8\n"
+                  "/engine X     — bing|yahoo|ddg|all\n"
+                  "/tor          — toggle Tor\n"
+                  "/filter N     — SQL ≥ N\n"
+                  "/stop         — stop job\n\n"
+                  "Proxies:\n"
+                  "/addproxy /addproxies /proxylist\n"
+                  "/proxycheck /proxyclean /testproxy\n"
+                  "/removeproxy [i]"),
+            reply_markup=main_menu_keyboard(sess))
         return
 
     if data == "m_back":
-        try:
-            await query.edit_message_text(
-                "🕷 DORK PARSER v20.0",
-                reply_markup=main_menu_keyboard(sess),
-            )
-        except Exception: pass
+        await safe_edit_message(context, chat_id, query.message.message_id,
+            text="🕷 DORK PARSER v24.0", reply_markup=main_menu_keyboard(sess))
         return
 
-    # Fallback for unknown callback
     log.warning(f"[CB] Unknown callback: {data}")
-    try:
-        await query.answer(f"Unknown action: {data}", show_alert=True)
-    except Exception: pass
-
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
@@ -3876,18 +3390,18 @@ def main():
     app.post_init = _on_startup
 
     log.info("=" * 60)
-    log.info("  DORK PARSER v21.0 — XTREAM EDITION")
+    log.info("  DORK PARSER v24.0 — XTREAM EDITION")
     log.info(f"  TLS profiles : {len(TLS_PROFILES)} rotating (Chrome/Firefox/Edge/Safari)")
     log.info(f"  Anti-block   : circuit-breaker | gaussian jitter | XFF spoof | param vary")
+    log.info(f"  CAPTCHA bypass: endpoint quarantine (20-360s) | shadow probe | query noise")
     log.info(f"  Standard     : ~200 URLs/sec ({N_CHUNKS}×{WORKERS_PER_CHUNK})")
     log.info(f"  Xtream       : {XTREAM_TARGET_RPS} RPS target ({XTREAM_CHUNKS}×{XTREAM_WORKERS_PER_CHUNK})")
     log.info(f"  Xtream pages : {XTREAM_PAGES_PER_DORK}/dork | pool: {XTREAM_SESSION_POOL_SIZE}")
-    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} | retries: {XTREAM_MAX_RETRIES}")
+    log.info(f"  Cookie seed  : {'on' if XTREAM_PRESEED_COOKIES else 'off'} (3-step chain) | retries: {XTREAM_MAX_RETRIES}")
     log.info(f"  Proxies      : {len(_proxy_pool)} loaded")
     log.info(f"  Engines      : {', '.join(ENGINES)}")
     log.info("=" * 60)
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
